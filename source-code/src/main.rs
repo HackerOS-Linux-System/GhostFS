@@ -4,13 +4,12 @@ use blake3::Hasher;
 use clap::Parser;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXAttr, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
-use libc::{c_int, ENOENT, EIO, EEXIST, EISDIR, ENOTDIR, ENOTEMPTY, ENOSPC};
+use libc::{c_int, EEXIST, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use rand::Rng;
-use rocksdb::{DB, Options, PrefixIterator, WriteBatch};
+use sled::{Batch, Db};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -22,16 +21,121 @@ const TTL: Duration = Duration::from_secs(1);
 const FS_BLOCK_SIZE: u32 = 4096;
 const ROOT_INO: u64 = 1;
 const NONCE_SIZE: usize = 12;
-const TAG_SIZE: usize = 16;
+
+// --- Serialization Helpers for Fuser Types ---
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+enum SerFileType {
+    NamedPipe,
+    CharDevice,
+    BlockDevice,
+    Directory,
+    RegularFile,
+    Symlink,
+    Socket,
+}
+
+impl From<FileType> for SerFileType {
+    fn from(kind: FileType) -> Self {
+        match kind {
+            FileType::NamedPipe => SerFileType::NamedPipe,
+            FileType::CharDevice => SerFileType::CharDevice,
+            FileType::BlockDevice => SerFileType::BlockDevice,
+            FileType::Directory => SerFileType::Directory,
+            FileType::RegularFile => SerFileType::RegularFile,
+            FileType::Symlink => SerFileType::Symlink,
+            FileType::Socket => SerFileType::Socket,
+        }
+    }
+}
+
+impl From<SerFileType> for FileType {
+    fn from(kind: SerFileType) -> Self {
+        match kind {
+            SerFileType::NamedPipe => FileType::NamedPipe,
+            SerFileType::CharDevice => FileType::CharDevice,
+            SerFileType::BlockDevice => FileType::BlockDevice,
+            SerFileType::Directory => FileType::Directory,
+            SerFileType::RegularFile => FileType::RegularFile,
+            SerFileType::Symlink => FileType::Symlink,
+            SerFileType::Socket => FileType::Socket,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SerFileAttr {
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    atime: SystemTime,
+    mtime: SystemTime,
+    ctime: SystemTime,
+    crtime: SystemTime,
+    kind: SerFileType,
+    perm: u16,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    blksize: u32,
+    flags: u32,
+}
+
+impl From<FileAttr> for SerFileAttr {
+    fn from(attr: FileAttr) -> Self {
+        Self {
+            ino: attr.ino,
+            size: attr.size,
+            blocks: attr.blocks,
+            atime: attr.atime,
+            mtime: attr.mtime,
+            ctime: attr.ctime,
+            crtime: attr.crtime,
+            kind: attr.kind.into(),
+            perm: attr.perm,
+            nlink: attr.nlink,
+            uid: attr.uid,
+            gid: attr.gid,
+            rdev: attr.rdev,
+            blksize: attr.blksize,
+            flags: attr.flags,
+        }
+    }
+}
+
+impl From<SerFileAttr> for FileAttr {
+    fn from(attr: SerFileAttr) -> Self {
+        Self {
+            ino: attr.ino,
+            size: attr.size,
+            blocks: attr.blocks,
+            atime: attr.atime,
+            mtime: attr.mtime,
+            ctime: attr.ctime,
+            crtime: attr.crtime,
+            kind: attr.kind.into(),
+            perm: attr.perm,
+            nlink: attr.nlink,
+            uid: attr.uid,
+            gid: attr.gid,
+            rdev: attr.rdev,
+            blksize: attr.blksize,
+            flags: attr.flags,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Inode {
-    attr: FileAttr,
+    attr: SerFileAttr,
     parent: u64,
 }
 
+// --- End Serialization Helpers ---
+
 struct HackerFS {
-    db: Arc<DB>,
+    db: Db,
     next_ino: AtomicU64,
     cipher: Option<Arc<Aes256Gcm>>,
     cybersecurity: bool,
@@ -39,22 +143,26 @@ struct HackerFS {
 
 impl HackerFS {
     fn new(db_path: &Path, cybersecurity: bool, key: Option<[u8; 32]>) -> Result<Self, c_int> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let db = Arc::new(DB::open(&opts, db_path).map_err(|_| EIO)?);
+        // Sled open returns Result<Db, sled::Error>
+        let db = sled::open(db_path).map_err(|_| EIO)?;
 
         let cipher = if cybersecurity {
             let key_bytes = key.ok_or(EIO)?;
-            Some(Arc::new(Aes256Gcm::new_from_slice(&key_bytes).map_err(|_| EIO)?))
+            Some(Arc::new(
+                Aes256Gcm::new_from_slice(&key_bytes).map_err(|_| EIO)?,
+            ))
         } else {
             None
         };
 
-        let next_ino = match db.get(b"next_ino") {
-            Ok(Some(v)) => bincode::deserialize(&v).map_err(|_| EIO)?,
-            Ok(None) => {
-                let mut batch = WriteBatch::default();
-                batch.put(b"next_ino", bincode::serialize(&(ROOT_INO + 1)).map_err(|_| EIO)?);
+        let next_ino = match db.get(b"next_ino").map_err(|_| EIO)? {
+            Some(v) => bincode::deserialize(&v).map_err(|_| EIO)?,
+            None => {
+                let mut batch = Batch::default();
+                batch.insert(
+                    b"next_ino",
+                    bincode::serialize(&(ROOT_INO + 1)).map_err(|_| EIO)?,
+                );
                 let root_attr = FileAttr {
                     ino: ROOT_INO,
                     size: 0,
@@ -72,18 +180,17 @@ impl HackerFS {
                     blksize: FS_BLOCK_SIZE,
                     flags: 0,
                 };
-                batch.put(
+                batch.insert(
                     format!("inode:{}", ROOT_INO).as_bytes(),
                         bincode::serialize(&Inode {
-                            attr: root_attr,
-                            parent: 0,
+                            attr: root_attr.into(),
+                                           parent: 0,
                         })
                         .map_err(|_| EIO)?,
                 );
-                db.write(batch).map_err(|_| EIO)?;
+                db.apply_batch(batch).map_err(|_| EIO)?;
                 ROOT_INO + 1
             }
-            Err(_) => return Err(EIO),
         };
 
         Ok(Self {
@@ -104,15 +211,12 @@ impl HackerFS {
 
     fn put_inode(&self, ino: u64, inode: Inode) -> Result<(), c_int> {
         self.db
-        .put(
+        .insert(
             format!("inode:{}", ino).as_bytes(),
                 bincode::serialize(&inode).map_err(|_| EIO)?,
         )
-        .map_err(|_| EIO)
-    }
-
-    fn delete_inode(&self, ino: u64) -> Result<(), c_int> {
-        self.db.delete(format!("inode:{}", ino).as_bytes()).map_err(|_| EIO)
+        .map_err(|_| EIO)?;
+        Ok(())
     }
 
     fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<Option<u64>, c_int> {
@@ -124,34 +228,27 @@ impl HackerFS {
         .transpose()
     }
 
-    fn put_dir_entry(&self, parent: u64, name: &OsStr, child_ino: u64) -> Result<(), c_int> {
-        let key = format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes()));
-        self.db
-        .put(key.as_bytes(), bincode::serialize(&child_ino).map_err(|_| EIO)?)
-        .map_err(|_| EIO)
-    }
-
-    fn delete_dir_entry(&self, parent: u64, name: &OsStr) -> Result<(), c_int> {
-        let key = format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes()));
-        self.db.delete(key.as_bytes()).map_err(|_| EIO)
-    }
-
     fn get_block(&self, ino: u64, block_idx: usize) -> Result<Vec<u8>, c_int> {
         let key = format!("data:{}:{}", ino, block_idx);
-        if let Some(mut data) = self.db.get(key.as_bytes()).map_err(|_| EIO)? {
+        if let Some(data) = self.db.get(key.as_bytes()).map_err(|_| EIO)? {
             if self.cybersecurity {
-                if data.len() < NONCE_SIZE + TAG_SIZE {
+                // Format: Nonce (12 bytes) + Ciphertext (includes Tag)
+                if data.len() < NONCE_SIZE {
                     return Err(EIO);
                 }
                 let nonce_slice = &data[0..NONCE_SIZE];
-                let ciphertext = &data[NONCE_SIZE..data.len() - TAG_SIZE];
-                let tag = &data[data.len() - TAG_SIZE..];
+                let ciphertext = &data[NONCE_SIZE..];
                 let nonce = Nonce::from_slice(nonce_slice);
                 let payload = Payload {
                     msg: ciphertext,
-                    aad: b"", // No AAD for simplicity
+                    aad: b"",
                 };
-                let plaintext = self.cipher.as_ref().unwrap().decrypt(nonce, payload).map_err(|_| EIO)?;
+                let plaintext = self
+                .cipher
+                .as_ref()
+                .unwrap()
+                .decrypt(nonce, payload)
+                .map_err(|_| EIO)?;
 
                 // Verify hash
                 let hash_key = format!("hash:{}:{}", ino, block_idx);
@@ -159,7 +256,7 @@ impl HackerFS {
                     let mut hasher = Hasher::new();
                     hasher.update(&plaintext);
                     let computed_hash = hasher.finalize();
-                    if stored_hash != computed_hash.as_bytes() {
+                    if stored_hash.as_ref() != computed_hash.as_bytes() {
                         return Err(EIO); // Tampered data
                     }
                 } else {
@@ -168,14 +265,14 @@ impl HackerFS {
 
                 Ok(plaintext)
             } else {
-                Ok(data)
+                Ok(data.to_vec())
             }
         } else {
             Ok(vec![0u8; FS_BLOCK_SIZE as usize])
         }
     }
 
-    fn put_block(&self, ino: u64, block_idx: usize, mut data: Vec<u8>) -> Result<(), c_int> {
+    fn put_block(&self, ino: u64, block_idx: usize, data: Vec<u8>) -> Result<(), c_int> {
         let key = format!("data:{}:{}", ino, block_idx);
         let hash_key = format!("hash:{}:{}", ino, block_idx);
 
@@ -186,30 +283,35 @@ impl HackerFS {
             let hash = hasher.finalize();
 
             // Encrypt
-            let nonce: [u8; NONCE_SIZE] = rand::thread_rng().gen();
-            let nonce_slice = Nonce::from_slice(&nonce);
+            let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
+            let nonce = Nonce::from_slice(&nonce_bytes);
             let payload = Payload {
                 msg: &data,
                 aad: b"",
             };
-            let mut ciphertext = self.cipher.as_ref().unwrap().encrypt(nonce_slice, payload).map_err(|_| EIO)?;
-            let mut stored_data = nonce.to_vec();
-            stored_data.append(&mut ciphertext);
-            let tag = ciphertext.split_off(ciphertext.len() - TAG_SIZE); // Wait, encrypt returns ciphertext + tag
-            // Actually, encrypt returns vec with ciphertext + tag appended
-            // So stored_data = nonce + encrypt output
-            stored_data.append(&mut ciphertext); // Fix: encrypt returns ciphertext||tag
-            let encrypt_result = self.cipher.as_ref().unwrap().encrypt(nonce_slice, &*data).map_err(|_| EIO)?;
-            let mut stored_data = nonce.to_vec();
-            stored_data.extend_from_slice(&encrypt_result);
 
-            self.db.put(key.as_bytes(), stored_data).map_err(|_| EIO)?;
-            self.db.put(hash_key.as_bytes(), hash.as_bytes()).map_err(|_| EIO)?;
+            // encrypt returns ciphertext + tag appended
+            let ciphertext = self
+            .cipher
+            .as_ref()
+            .unwrap()
+            .encrypt(nonce, payload)
+            .map_err(|_| EIO)?;
+
+            let mut stored_data = nonce_bytes.to_vec();
+            stored_data.extend_from_slice(&ciphertext);
+
+            self.db
+            .insert(key.as_bytes(), stored_data)
+            .map_err(|_| EIO)?;
+            self.db
+            .insert(hash_key.as_bytes(), hash.as_bytes())
+            .map_err(|_| EIO)?;
         } else {
             if data.iter().all(|&b| b == 0) {
-                self.db.delete(key.as_bytes()).map_err(|_| EIO)?; // Sparse
+                self.db.remove(key.as_bytes()).map_err(|_| EIO)?; // Sparse
             } else {
-                self.db.put(key.as_bytes(), data).map_err(|_| EIO)?;
+                self.db.insert(key.as_bytes(), data).map_err(|_| EIO)?;
             }
         }
         Ok(())
@@ -224,7 +326,11 @@ impl HackerFS {
         for block_idx in start_block..end_block {
             let mut block = self.get_block(ino, block_idx)?;
             if block_idx == start_block {
-                block.drain(0..inner_offset);
+                if inner_offset < block.len() {
+                    block.drain(0..inner_offset);
+                } else {
+                    block.clear();
+                }
             }
             let take = (size as usize - result.len()).min(block.len());
             result.extend_from_slice(&block[0..take]);
@@ -247,10 +353,21 @@ impl HackerFS {
         let mut pos = 0;
         for block_idx in start_block..end_block {
             let mut block = self.get_block(ino, block_idx)?;
-            let block_start = if block_idx == start_block { inner_offset } else { 0 };
+            let block_start = if block_idx == start_block {
+                inner_offset
+            } else {
+                0
+            };
+
+            // Ensure block has enough size to write into
+            if block.len() < FS_BLOCK_SIZE as usize {
+                block.resize(FS_BLOCK_SIZE as usize, 0);
+            }
+
             let bytes_to_write = (FS_BLOCK_SIZE as usize - block_start).min(data_len - pos);
-            block.resize(FS_BLOCK_SIZE as usize, 0);
-            block[block_start..block_start + bytes_to_write].copy_from_slice(&data[pos..pos + bytes_to_write]);
+            block[block_start..block_start + bytes_to_write]
+            .copy_from_slice(&data[pos..pos + bytes_to_write]);
+
             self.put_block(ino, block_idx, block[0..FS_BLOCK_SIZE as usize].to_vec())?;
             pos += bytes_to_write;
         }
@@ -268,55 +385,36 @@ impl HackerFS {
 
     fn is_dir_empty(&self, ino: u64) -> Result<bool, c_int> {
         let prefix = format!("dir:{}:", ino);
-        Ok(self.db.prefix_iterator(prefix.as_bytes()).next().is_none())
+        // Sled scan_prefix returns iterator. Check if it yields any item.
+        let mut iter = self.db.scan_prefix(prefix.as_bytes());
+        Ok(iter.next().is_none())
     }
 
     fn readdir_entries(&self, ino: u64) -> Result<Vec<(u64, FileType, OsString)>, c_int> {
         let prefix = format!("dir:{}:", ino);
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        let iter = self.db.scan_prefix(prefix.as_bytes());
         let mut entries = Vec::new();
+
         for res in iter {
             let (k, v) = res.map_err(|_| EIO)?;
             let k_str = String::from_utf8(k.to_vec()).map_err(|_| EIO)?;
+
+            // scan_prefix guarantees keys start with prefix, but checking is safe
             if !k_str.starts_with(&prefix) {
                 break;
             }
+
             let name = OsString::from(k_str[prefix.len()..].to_string());
             let child_ino: u64 = bincode::deserialize(&v).map_err(|_| EIO)?;
             let inode = self.get_inode(child_ino)?.ok_or(ENOENT)?;
-            entries.push((child_ino, inode.attr.kind, name));
+            entries.push((child_ino, inode.attr.kind.into(), name));
         }
         Ok(entries)
     }
 
-    fn delete_data_blocks(&self, ino: u64) -> Result<(), c_int> {
-        let prefix = format!("data:{}:", ino);
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
-        let mut batch = WriteBatch::default();
-        for res in iter {
-            let (k, _) = res.map_err(|_| EIO)?;
-            let k_str = String::from_utf8(k.to_vec()).map_err(|_| EIO)?;
-            if !k_str.starts_with(&prefix) {
-                break;
-            }
-            batch.delete(&k);
-        }
-        let hash_prefix = format!("hash:{}:", ino);
-        let hash_iter = self.db.prefix_iterator(hash_prefix.as_bytes());
-        for res in hash_iter {
-            let (k, _) = res.map_err(|_| EIO)?;
-            let k_str = String::from_utf8(k.to_vec()).map_err(|_| EIO)?;
-            if !k_str.starts_with(&hash_prefix) {
-                break;
-            }
-            batch.delete(&k);
-        }
-        self.db.write(batch).map_err(|_| EIO)
-    }
-
     fn get_xattrs(&self, ino: u64) -> Result<Vec<OsString>, c_int> {
         let prefix = format!("xattr:{}:", ino);
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        let iter = self.db.scan_prefix(prefix.as_bytes());
         let mut names = Vec::new();
         for res in iter {
             let (k, _) = res.map_err(|_| EIO)?;
@@ -330,27 +428,41 @@ impl HackerFS {
     }
 
     fn get_xattr(&self, ino: u64, name: &OsStr) -> Result<Option<Vec<u8>>, c_int> {
-        let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
-        self.db.get(key.as_bytes()).map_err(|_| EIO)
+        let key = format!(
+            "xattr:{}:{}",
+            ino,
+            String::from_utf8_lossy(name.as_bytes())
+        );
+        self.db.get(key.as_bytes()).map(|opt| opt.map(|iv| iv.to_vec())).map_err(|_| EIO)
     }
 
     fn put_xattr(&self, ino: u64, name: &OsStr, value: &[u8]) -> Result<(), c_int> {
-        let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
-        self.db.put(key.as_bytes(), value).map_err(|_| EIO)
+        let key = format!(
+            "xattr:{}:{}",
+            ino,
+            String::from_utf8_lossy(name.as_bytes())
+        );
+        self.db.insert(key.as_bytes(), value).map_err(|_| EIO)?;
+        Ok(())
     }
 
     fn delete_xattr(&self, ino: u64, name: &OsStr) -> Result<(), c_int> {
-        let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
-        self.db.delete(key.as_bytes()).map_err(|_| EIO)
+        let key = format!(
+            "xattr:{}:{}",
+            ino,
+            String::from_utf8_lossy(name.as_bytes())
+        );
+        self.db.remove(key.as_bytes()).map_err(|_| EIO)?;
+        Ok(())
     }
 }
 
 impl Filesystem for HackerFS {
-    fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_name(parent, name) {
             Ok(Some(ino)) => {
                 if let Ok(Some(inode)) = self.get_inode(ino) {
-                    reply.entry(&TTL, &inode.attr, 0);
+                    reply.entry(&TTL, &inode.attr.into(), 0);
                     return;
                 }
             }
@@ -359,23 +471,23 @@ impl Filesystem for HackerFS {
         reply.error(ENOENT);
     }
 
-    fn getattr(&self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.get_inode(ino) {
-            Ok(Some(inode)) => reply.attr(&TTL, &inode.attr),
+            Ok(Some(inode)) => reply.attr(&TTL, &inode.attr.into()),
             _ => reply.error(ENOENT),
         }
     }
 
     fn setattr(
-        &self,
+        &mut self,
         _req: &Request,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<SystemTime>,
-        mtime: Option<SystemTime>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -391,7 +503,8 @@ impl Filesystem for HackerFS {
                 return;
             }
         };
-        let mut attr = inode.attr;
+        let mut attr: FileAttr = inode.attr.into();
+
         if let Some(m) = mode {
             attr.perm = m as u16;
         }
@@ -408,13 +521,22 @@ impl Filesystem for HackerFS {
                 return;
             }
         }
+
+        let now = SystemTime::now();
         if let Some(a) = atime {
-            attr.atime = a;
+            attr.atime = match a {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            };
         }
         if let Some(m) = mtime {
-            attr.mtime = m;
+            attr.mtime = match m {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            };
         }
-        inode.attr = attr;
+
+        inode.attr = attr.into();
         if self.put_inode(ino, inode).is_err() {
             reply.error(EIO);
             return;
@@ -423,7 +545,7 @@ impl Filesystem for HackerFS {
     }
 
     fn mknod(
-        &self,
+        &mut self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -465,26 +587,32 @@ impl Filesystem for HackerFS {
             blksize: FS_BLOCK_SIZE,
             flags: 0,
         };
-        let mut batch = WriteBatch::default();
-        batch.put(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap());
-        let inode = Inode { attr, parent };
-        batch.put(
+        let mut batch = Batch::default();
+        batch.insert(
+            b"next_ino",
+            bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap(),
+        );
+        let inode = Inode {
+            attr: attr.into(),
+            parent,
+        };
+        batch.insert(
             format!("inode:{}", ino).as_bytes(),
                 bincode::serialize(&inode).unwrap(),
         );
         let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-        batch.put(
+        batch.insert(
             format!("dir:{}:{}", parent, name_str).as_bytes(),
                 bincode::serialize(&ino).unwrap(),
         );
         if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
             parent_inode.attr.mtime = now;
-            batch.put(
+            batch.insert(
                 format!("inode:{}", parent).as_bytes(),
                     bincode::serialize(&parent_inode).unwrap(),
             );
         }
-        if self.db.write(batch).is_err() {
+        if self.db.apply_batch(batch).is_err() {
             reply.error(EIO);
             return;
         }
@@ -492,7 +620,7 @@ impl Filesystem for HackerFS {
     }
 
     fn mkdir(
-        &self,
+        &mut self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -524,83 +652,91 @@ impl Filesystem for HackerFS {
             blksize: FS_BLOCK_SIZE,
             flags: 0,
         };
-        let mut batch = WriteBatch::default();
-        batch.put(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap());
-        let inode = Inode { attr, parent };
-        batch.put(
+        let mut batch = Batch::default();
+        batch.insert(
+            b"next_ino",
+            bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap(),
+        );
+        let inode = Inode {
+            attr: attr.into(),
+            parent,
+        };
+        batch.insert(
             format!("inode:{}", ino).as_bytes(),
                 bincode::serialize(&inode).unwrap(),
         );
         let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-        batch.put(
+        batch.insert(
             format!("dir:{}:{}", parent, name_str).as_bytes(),
                 bincode::serialize(&ino).unwrap(),
         );
         if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
             parent_inode.attr.mtime = now;
             parent_inode.attr.nlink += 1;
-            batch.put(
+            batch.insert(
                 format!("inode:{}", parent).as_bytes(),
                     bincode::serialize(&parent_inode).unwrap(),
             );
         }
-        if self.db.write(batch).is_err() {
+        if self.db.apply_batch(batch).is_err() {
             reply.error(EIO);
             return;
         }
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn unlink(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if let Ok(Some(ino)) = self.lookup_name(parent, name) {
             if let Ok(Some(mut inode)) = self.get_inode(ino) {
-                if inode.attr.kind == FileType::Directory {
+                // Konwersja z SerFileType na FileType dla sprawdzenia
+                let kind: FileType = inode.attr.kind.into();
+                if kind == FileType::Directory {
                     reply.error(EISDIR);
                     return;
                 }
                 inode.attr.nlink -= 1;
-                let mut batch = WriteBatch::default();
+                let mut batch = Batch::default();
                 let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-                batch.delete(format!("dir:{}:{}", parent, name_str).as_bytes());
+                batch.remove(format!("dir:{}:{}", parent, name_str).as_bytes());
                 if inode.attr.nlink == 0 {
-                    batch.delete(format!("inode:{}", ino).as_bytes());
+                    batch.remove(format!("inode:{}", ino).as_bytes());
                     // Delete data blocks
                     let data_prefix = format!("data:{}:", ino);
-                    let data_iter = self.db.prefix_iterator(data_prefix.as_bytes());
+                    let data_iter = self.db.scan_prefix(data_prefix.as_bytes());
                     for res in data_iter {
                         if let Ok((k, _)) = res {
                             let k_str = String::from_utf8(k.to_vec()).unwrap();
                             if !k_str.starts_with(&data_prefix) {
                                 break;
                             }
-                            batch.delete(&k);
+                            batch.remove(k);
                         }
                     }
                     let hash_prefix = format!("hash:{}:", ino);
-                    let hash_iter = self.db.prefix_iterator(hash_prefix.as_bytes());
+                    let hash_iter = self.db.scan_prefix(hash_prefix.as_bytes());
                     for res in hash_iter {
                         if let Ok((k, _)) = res {
                             let k_str = String::from_utf8(k.to_vec()).unwrap();
                             if !k_str.starts_with(&hash_prefix) {
                                 break;
                             }
-                            batch.delete(&k);
+                            batch.remove(k);
                         }
                     }
                     // Delete xattrs
                     let xattr_prefix = format!("xattr:{}:", ino);
-                    let xattr_iter = self.db.prefix_iterator(xattr_prefix.as_bytes());
+                    let xattr_iter = self.db.scan_prefix(xattr_prefix.as_bytes());
                     for res in xattr_iter {
                         if let Ok((k, _)) = res {
                             let k_str = String::from_utf8(k.to_vec()).unwrap();
                             if !k_str.starts_with(&xattr_prefix) {
                                 break;
                             }
-                            batch.delete(&k);
+                            batch.remove(k);
                         }
                     }
                 } else {
-                    batch.put(
+                    batch.insert(
                         format!("inode:{}", ino).as_bytes(),
                             bincode::serialize(&inode).unwrap(),
                     );
@@ -608,12 +744,12 @@ impl Filesystem for HackerFS {
                 let now = SystemTime::now();
                 if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
                     parent_inode.attr.mtime = now;
-                    batch.put(
+                    batch.insert(
                         format!("inode:{}", parent).as_bytes(),
                             bincode::serialize(&parent_inode).unwrap(),
                     );
                 }
-                if self.db.write(batch).is_err() {
+                if self.db.apply_batch(batch).is_err() {
                     reply.error(EIO);
                     return;
                 }
@@ -624,10 +760,11 @@ impl Filesystem for HackerFS {
         reply.error(ENOENT);
     }
 
-    fn rmdir(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         if let Ok(Some(ino)) = self.lookup_name(parent, name) {
             if let Ok(Some(inode)) = self.get_inode(ino) {
-                if inode.attr.kind != FileType::Directory {
+                let kind: FileType = inode.attr.kind.into();
+                if kind != FileType::Directory {
                     reply.error(ENOTDIR);
                     return;
                 }
@@ -635,20 +772,20 @@ impl Filesystem for HackerFS {
                     reply.error(ENOTEMPTY);
                     return;
                 }
-                let mut batch = WriteBatch::default();
+                let mut batch = Batch::default();
                 let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-                batch.delete(format!("dir:{}:{}", parent, name_str).as_bytes());
-                batch.delete(format!("inode:{}", ino).as_bytes());
+                batch.remove(format!("dir:{}:{}", parent, name_str).as_bytes());
+                batch.remove(format!("inode:{}", ino).as_bytes());
                 let now = SystemTime::now();
                 if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
                     parent_inode.attr.mtime = now;
                     parent_inode.attr.nlink -= 1;
-                    batch.put(
+                    batch.insert(
                         format!("inode:{}", parent).as_bytes(),
                             bincode::serialize(&parent_inode).unwrap(),
                     );
                 }
-                if self.db.write(batch).is_err() {
+                if self.db.apply_batch(batch).is_err() {
                     reply.error(EIO);
                     return;
                 }
@@ -660,7 +797,7 @@ impl Filesystem for HackerFS {
     }
 
     fn symlink(
-        &self,
+        &mut self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -692,38 +829,45 @@ impl Filesystem for HackerFS {
             blksize: FS_BLOCK_SIZE,
             flags: 0,
         };
-        let mut batch = WriteBatch::default();
-        batch.put(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap());
-        let inode = Inode { attr, parent };
-        batch.put(
+        let mut batch = Batch::default();
+        batch.insert(
+            b"next_ino",
+            bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap(),
+        );
+        let inode = Inode {
+            attr: attr.into(),
+            parent,
+        };
+        batch.insert(
             format!("inode:{}", ino).as_bytes(),
                 bincode::serialize(&inode).unwrap(),
         );
         let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-        batch.put(
+        batch.insert(
             format!("dir:{}:{}", parent, name_str).as_bytes(),
                 bincode::serialize(&ino).unwrap(),
         );
         // Store target in data:0 for symlink
         let symlink_key = format!("data:{}:0", ino);
-        batch.put(symlink_key.as_bytes(), target);
+        batch.insert(symlink_key.as_bytes(), target);
         if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
             parent_inode.attr.mtime = now;
-            batch.put(
+            batch.insert(
                 format!("inode:{}", parent).as_bytes(),
                     bincode::serialize(&parent_inode).unwrap(),
             );
         }
-        if self.db.write(batch).is_err() {
+        if self.db.apply_batch(batch).is_err() {
             reply.error(EIO);
             return;
         }
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn readlink(&self, _req: &Request, ino: u64, reply: fuser::ReplyData) {
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
         if let Ok(Some(inode)) = self.get_inode(ino) {
-            if inode.attr.kind != FileType::Symlink {
+            let kind: FileType = inode.attr.kind.into();
+            if kind != FileType::Symlink {
                 reply.error(ENOENT);
                 return;
             }
@@ -736,47 +880,48 @@ impl Filesystem for HackerFS {
         reply.error(EIO);
     }
 
-    fn link(&self, req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
         if self.lookup_name(newparent, newname).unwrap_or(None).is_some() {
             reply.error(EEXIST);
             return;
         }
         if let Ok(Some(mut inode)) = self.get_inode(ino) {
-            if inode.attr.kind == FileType::Directory {
+            let kind: FileType = inode.attr.kind.into();
+            if kind == FileType::Directory {
                 reply.error(EISDIR);
                 return;
             }
             inode.attr.nlink += 1;
-            let mut batch = WriteBatch::default();
-            batch.put(
+            let mut batch = Batch::default();
+            batch.insert(
                 format!("inode:{}", ino).as_bytes(),
                     bincode::serialize(&inode).unwrap(),
             );
             let newname_str = String::from_utf8_lossy(newname.as_bytes()).to_string();
-            batch.put(
+            batch.insert(
                 format!("dir:{}:{}", newparent, newname_str).as_bytes(),
                     bincode::serialize(&ino).unwrap(),
             );
             let now = SystemTime::now();
             if let Ok(Some(mut newparent_inode)) = self.get_inode(newparent) {
                 newparent_inode.attr.mtime = now;
-                batch.put(
+                batch.insert(
                     format!("inode:{}", newparent).as_bytes(),
                         bincode::serialize(&newparent_inode).unwrap(),
                 );
             }
-            if self.db.write(batch).is_err() {
+            if self.db.apply_batch(batch).is_err() {
                 reply.error(EIO);
                 return;
             }
-            reply.entry(&TTL, &inode.attr, 0);
+            reply.entry(&TTL, &inode.attr.into(), 0);
             return;
         }
         reply.error(ENOENT);
     }
 
     fn rename(
-        &self,
+        &mut self,
         _req: &Request,
         parent: u64,
         name: &OsStr,
@@ -787,39 +932,45 @@ impl Filesystem for HackerFS {
     ) {
         if let Ok(Some(ino)) = self.lookup_name(parent, name) {
             if let Ok(Some(mut inode)) = self.get_inode(ino) {
-                if self.lookup_name(newparent, newname).unwrap_or(None).is_some() {
-                    reply.error(EEXIST);
-                    return;
-                }
-                let mut batch = WriteBatch::default();
+                if self
+                    .lookup_name(newparent, newname)
+                    .unwrap_or(None)
+                    .is_some()
+                    {
+                        reply.error(EEXIST);
+                        return;
+                    }
+                    let mut batch = Batch::default();
                 let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-                batch.delete(format!("dir:{}:{}", parent, name_str).as_bytes());
+                batch.remove(format!("dir:{}:{}", parent, name_str).as_bytes());
                 let newname_str = String::from_utf8_lossy(newname.as_bytes()).to_string();
-                batch.put(
+                batch.insert(
                     format!("dir:{}:{}", newparent, newname_str).as_bytes(),
                         bincode::serialize(&ino).unwrap(),
                 );
                 let now = SystemTime::now();
+                let kind: FileType = inode.attr.kind.into();
+
                 if parent != newparent {
-                    if inode.attr.kind == FileType::Directory {
+                    if kind == FileType::Directory {
                         inode.parent = newparent;
                     }
                     if let Ok(Some(mut old_parent_inode)) = self.get_inode(parent) {
                         old_parent_inode.attr.mtime = now;
-                        if inode.attr.kind == FileType::Directory {
+                        if kind == FileType::Directory {
                             old_parent_inode.attr.nlink -= 1;
                         }
-                        batch.put(
+                        batch.insert(
                             format!("inode:{}", parent).as_bytes(),
                                 bincode::serialize(&old_parent_inode).unwrap(),
                         );
                     }
                     if let Ok(Some(mut new_parent_inode)) = self.get_inode(newparent) {
                         new_parent_inode.attr.mtime = now;
-                        if inode.attr.kind == FileType::Directory {
+                        if kind == FileType::Directory {
                             new_parent_inode.attr.nlink += 1;
                         }
-                        batch.put(
+                        batch.insert(
                             format!("inode:{}", newparent).as_bytes(),
                                 bincode::serialize(&new_parent_inode).unwrap(),
                         );
@@ -827,17 +978,17 @@ impl Filesystem for HackerFS {
                 } else {
                     if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
                         parent_inode.attr.mtime = now;
-                        batch.put(
+                        batch.insert(
                             format!("inode:{}", parent).as_bytes(),
                                 bincode::serialize(&parent_inode).unwrap(),
                         );
                     }
                 }
-                batch.put(
+                batch.insert(
                     format!("inode:{}", ino).as_bytes(),
                         bincode::serialize(&inode).unwrap(),
                 );
-                if self.db.write(batch).is_err() {
+                if self.db.apply_batch(batch).is_err() {
                     reply.error(EIO);
                     return;
                 }
@@ -848,19 +999,19 @@ impl Filesystem for HackerFS {
         reply.error(ENOENT);
     }
 
-    fn open(&self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
         reply.opened(0, 0);
     }
 
     fn read(
-        &self,
+        &mut self,
         _req: &Request,
         ino: u64,
         _fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
-        _lock_owner: Option<fuser::LockOwner>,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         match self.read_data(ino, offset, size) {
@@ -870,15 +1021,15 @@ impl Filesystem for HackerFS {
     }
 
     fn write(
-        &self,
-        req: &Request,
+        &mut self,
+        _req: &Request,
         ino: u64,
         _fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
         _flags: i32,
-        _lock_owner: Option<fuser::LockOwner>,
+        _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         match self.write_data(ino, offset, data) {
@@ -899,11 +1050,11 @@ impl Filesystem for HackerFS {
     }
 
     fn flush(
-        &self,
+        &mut self,
         _req: &Request,
         _ino: u64,
         _fh: u64,
-        _lock_owner: Option<fuser::LockOwner>,
+        _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
         if self.db.flush().is_err() {
@@ -914,7 +1065,7 @@ impl Filesystem for HackerFS {
     }
 
     fn fsync(
-        &self,
+        &mut self,
         _req: &Request,
         _ino: u64,
         _fh: u64,
@@ -929,7 +1080,7 @@ impl Filesystem for HackerFS {
     }
 
     fn create(
-        &self,
+        &mut self,
         req: &Request,
         parent: u64,
         name: &OsStr,
@@ -962,26 +1113,32 @@ impl Filesystem for HackerFS {
             blksize: FS_BLOCK_SIZE,
             flags: 0,
         };
-        let mut batch = WriteBatch::default();
-        batch.put(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap());
-        let inode = Inode { attr, parent };
-        batch.put(
+        let mut batch = Batch::default();
+        batch.insert(
+            b"next_ino",
+            bincode::serialize(&self.next_ino.load(Ordering::SeqCst)).unwrap(),
+        );
+        let inode = Inode {
+            attr: attr.into(),
+            parent,
+        };
+        batch.insert(
             format!("inode:{}", ino).as_bytes(),
                 bincode::serialize(&inode).unwrap(),
         );
         let name_str = String::from_utf8_lossy(name.as_bytes()).to_string();
-        batch.put(
+        batch.insert(
             format!("dir:{}:{}", parent, name_str).as_bytes(),
                 bincode::serialize(&ino).unwrap(),
         );
         if let Ok(Some(mut parent_inode)) = self.get_inode(parent) {
             parent_inode.attr.mtime = now;
-            batch.put(
+            batch.insert(
                 format!("inode:{}", parent).as_bytes(),
                     bincode::serialize(&parent_inode).unwrap(),
             );
         }
-        if self.db.write(batch).is_err() {
+        if self.db.apply_batch(batch).is_err() {
             reply.error(EIO);
             return;
         }
@@ -989,7 +1146,7 @@ impl Filesystem for HackerFS {
     }
 
     fn readdir(
-        &self,
+        &mut self,
         _req: &Request,
         ino: u64,
         _fh: u64,
@@ -1003,7 +1160,11 @@ impl Filesystem for HackerFS {
                 return;
             }
         };
-        let parent_ino = if inode.parent == 0 { ino } else { inode.parent };
+        let parent_ino = if inode.parent == 0 {
+            ino
+        } else {
+            inode.parent
+        };
         let parent_kind = FileType::Directory; // Assume
         let mut entries: Vec<(u64, FileType, OsString)> = vec![
             (ino, FileType::Directory, OsString::from(".")),
@@ -1021,7 +1182,7 @@ impl Filesystem for HackerFS {
         reply.ok();
     }
 
-    fn getxattr(&self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXAttr) {
+    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
         match self.get_xattr(ino, name) {
             Ok(Some(value)) => {
                 if size == 0 {
@@ -1038,7 +1199,7 @@ impl Filesystem for HackerFS {
     }
 
     fn setxattr(
-        &self,
+        &mut self,
         _req: &Request,
         ino: u64,
         name: &OsStr,
@@ -1058,7 +1219,7 @@ impl Filesystem for HackerFS {
         }
     }
 
-    fn listxattr(&self, _req: &Request, ino: u64, size: u32, reply: ReplyXAttr) {
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
         match self.get_xattrs(ino) {
             Ok(names) => {
                 let mut data = Vec::new();
@@ -1078,7 +1239,7 @@ impl Filesystem for HackerFS {
         }
     }
 
-    fn removexattr(&self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&mut self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         if self.delete_xattr(ino, name).is_err() {
             reply.error(EIO);
         } else {
@@ -1086,7 +1247,7 @@ impl Filesystem for HackerFS {
         }
     }
 
-    fn statfs(&self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: fuser::ReplyStatfs) {
         // Dummy stats
         reply.statfs(0, 0, 0, 0, 0, FS_BLOCK_SIZE, 255, 0);
     }
@@ -1122,11 +1283,12 @@ fn main() {
     } else {
         None
     };
-    let fs = HackerFS::new(Path::new(&args.db_path), args.cybersecurity, key).expect("Failed to init FS");
+    let fs = HackerFS::new(Path::new(&args.db_path), args.cybersecurity, key)
+    .expect("Failed to init FS");
     let options = vec![
         MountOption::RW,
         MountOption::FSName("hackerfs".to_string()),
+        MountOption::AutoUnmount,
     ];
     fuser::mount2(fs, &args.mount_point, &options).unwrap();
 }
-
