@@ -53,7 +53,7 @@ pub struct HFS {
 impl HFS {
     pub fn new(db_path: &Path, cybersecurity: bool, key: Option<Key>, compression_type: Option<String>, noatime: bool) -> Result<Self> {
         let db = sled::open(db_path)
-        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
+            .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
         let crypto = if cybersecurity {
             let key = key.ok_or_else(|| anyhow::anyhow!("Cybersecurity mode requires a key"))?;
@@ -64,11 +64,11 @@ impl HFS {
 
         let compression = Compression::new(match compression_type.as_deref() {
             Some("zlib") => CompressionType::Zlib,
-                                           #[cfg(feature = "zstd")]
-                                           Some("zstd") => CompressionType::Zstd,
-                                           #[cfg(feature = "lz4")]
-                                           Some("lz4") => CompressionType::Lz4,
-                                           _ => CompressionType::None,
+            #[cfg(feature = "zstd")]
+            Some("zstd") => CompressionType::Zstd,
+            #[cfg(feature = "lz4")]
+            Some("lz4") => CompressionType::Lz4,
+            _ => CompressionType::None,
         });
 
         let dedup = Deduplication::new(&db)?;
@@ -103,7 +103,7 @@ impl HFS {
                 };
                 batch.insert(
                     format!("inode:{}", ROOT_INO).as_bytes(),
-                        bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
+                    bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
                 );
                 db.apply_batch(batch)?;
                 ROOT_INO + 1
@@ -124,17 +124,17 @@ impl HFS {
         Ok(Self {
             db,
             next_ino: AtomicU64::new(next_ino),
-           crypto,
-           compression,
-           dedup,
-           versioning,
-           audit,
-           quota,
-           xattr,
-           repair,
-           cache,
-           noatime,
-           background_repair_sender: Some(tx),
+            crypto,
+            compression,
+            dedup,
+            versioning,
+            audit,
+            quota,
+            xattr,
+            repair,
+            cache,
+            noatime,
+            background_repair_sender: Some(tx),
         })
     }
 
@@ -276,7 +276,7 @@ impl HFS {
             }
             let bytes_to_write = (FS_BLOCK_SIZE as usize - block_start).min(data.len() - pos);
             block[block_start..block_start + bytes_to_write]
-            .copy_from_slice(&data[pos..pos + bytes_to_write]);
+                .copy_from_slice(&data[pos..pos + bytes_to_write]);
             self.put_block(ino, block_idx, &block)?;
             pos += bytes_to_write;
         }
@@ -346,11 +346,43 @@ impl HFS {
 
     pub(crate) fn with_batch<F>(&self, f: F) -> Result<(), HfsError>
     where
-    F: FnOnce(&mut sled::Batch) -> Result<(), HfsError>,
+        F: FnOnce(&mut sled::Batch) -> Result<(), HfsError>,
     {
         let mut batch = sled::Batch::default();
         f(&mut batch)?;
         self.db.apply_batch(batch)?;
         Ok(())
     }
+}
+
+// Public API for filesystem creation
+pub fn format(db_path: &Path, encryption: bool, block_size: Option<u32>) -> Result<(), HfsError> {
+    let db = sled::open(db_path)?;
+    let mut batch = sled::Batch::default();
+    batch.insert(b"next_ino", bincode::serialize(&(ROOT_INO + 1))?);
+    let root_attr = fuser::FileAttr {
+        ino: ROOT_INO,
+        size: 0,
+        blocks: 0,
+        atime: std::time::UNIX_EPOCH,
+        mtime: std::time::UNIX_EPOCH,
+        ctime: std::time::UNIX_EPOCH,
+        crtime: std::time::UNIX_EPOCH,
+        kind: fuser::FileType::Directory,
+        perm: 0o755,
+        nlink: 2,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: block_size.unwrap_or(FS_BLOCK_SIZE),
+        flags: 0,
+    };
+    let inode = Inode { attr: root_attr.into(), parent: 0 };
+    batch.insert(
+        format!("inode:{}", ROOT_INO).as_bytes(),
+        bincode::serialize(&inode)?,
+    );
+    db.apply_batch(batch)?;
+    db.flush()?;
+    Ok(())
 }
