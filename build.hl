@@ -1,4 +1,5 @@
 // cargo
+// libfuse3-dev
 
 > cd source-code
 > cargo build --release
