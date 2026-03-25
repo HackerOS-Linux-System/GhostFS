@@ -5,7 +5,7 @@ use fuser::MountOption;
 
 #[derive(Parser)]
 #[command(name = "hfs")]
-#[command(about = "Hacker File System", long_about = None)]
+#[command(about = "HackerOS File System", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
