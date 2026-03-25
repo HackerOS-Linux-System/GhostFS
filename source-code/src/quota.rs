@@ -4,7 +4,7 @@ use crate::error::HfsError;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct UserQuota {
-    limit: u64,   // 0 means unlimited
+    limit: u64,
     used: u64,
 }
 
@@ -31,32 +31,23 @@ impl Quota {
         Ok(())
     }
 
-    /// Check if adding `additional` bytes would exceed the user's quota.
     pub fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
         let quota = self.get_quota(uid)?;
         if quota.limit > 0 && quota.used + additional > quota.limit {
-            return Err(HfsError::QuotaExceeded);
+            return Err(HfsError::QuotaExceeded(uid));
         }
         Ok(())
     }
 
-    /// Update the used space for a user (increase or decrease).
     pub fn update_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
         let mut quota = self.get_quota(uid)?;
         quota.used = quota.used.saturating_add(delta);
         self.set_quota(uid, &quota)
     }
 
-    /// Set a quota limit for a user (0 = unlimited).
     pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), HfsError> {
         let mut quota = self.get_quota(uid)?;
         quota.limit = limit;
         self.set_quota(uid, &quota)
-    }
-
-    /// Get the current usage and limit for a user.
-    pub fn get_usage_and_limit(&self, uid: u32) -> Result<(u64, u64), HfsError> {
-        let quota = self.get_quota(uid)?;
-        Ok((quota.used, quota.limit))
     }
 }
