@@ -1,10 +1,10 @@
 use sled::Db;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use crate::error::HfsError;
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct UserQuota {
-    limit: u64,   // 0 oznacza brak limitu
+    limit: u64,   // 0 means unlimited
     used: u64,
 }
 
@@ -13,41 +13,50 @@ pub struct Quota {
 }
 
 impl Quota {
-    pub fn new(db: &Db) -> Result<Self, ()> {
+    pub fn new(db: &Db) -> Result<Self, HfsError> {
         Ok(Self { db: db.clone() })
     }
 
-    fn get_quota(&self, uid: u32) -> Result<UserQuota, ()> {
+    fn get_quota(&self, uid: u32) -> Result<UserQuota, HfsError> {
         let key = format!("quota:{}", uid);
-        match self.db.get(key.as_bytes()).map_err(|_| ())? {
-            Some(v) => bincode::deserialize(&v).map_err(|_| ()),
+        match self.db.get(key.as_bytes())? {
+            Some(v) => Ok(bincode::deserialize(&v)?),
             None => Ok(UserQuota::default()),
         }
     }
 
-    fn set_quota(&self, uid: u32, quota: UserQuota) -> Result<(), ()> {
+    fn set_quota(&self, uid: u32, quota: &UserQuota) -> Result<(), HfsError> {
         let key = format!("quota:{}", uid);
-        self.db.insert(key.as_bytes(), bincode::serialize(&quota).map_err(|_| ())?).map_err(|_| ())?;
+        self.db.insert(key.as_bytes(), bincode::serialize(quota)?)?;
         Ok(())
     }
 
-    pub fn check_quota(&self, uid: u32, additional: u64) -> Result<(), c_int> {
+    /// Check if adding `additional` bytes would exceed the user's quota.
+    pub fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
         let quota = self.get_quota(uid)?;
         if quota.limit > 0 && quota.used + additional > quota.limit {
-            return Err(libc::EDQUOT);
+            return Err(HfsError::QuotaExceeded);
         }
         Ok(())
     }
 
-    pub fn update_usage(&self, uid: u32, delta: u64) -> Result<(), ()> {
+    /// Update the used space for a user (increase or decrease).
+    pub fn update_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
         let mut quota = self.get_quota(uid)?;
-        quota.used += delta;
-        self.set_quota(uid, quota)
+        quota.used = quota.used.saturating_add(delta);
+        self.set_quota(uid, &quota)
     }
 
-    pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), ()> {
+    /// Set a quota limit for a user (0 = unlimited).
+    pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), HfsError> {
         let mut quota = self.get_quota(uid)?;
         quota.limit = limit;
-        self.set_quota(uid, quota)
+        self.set_quota(uid, &quota)
+    }
+
+    /// Get the current usage and limit for a user.
+    pub fn get_usage_and_limit(&self, uid: u32) -> Result<(u64, u64), HfsError> {
+        let quota = self.get_quota(uid)?;
+        Ok((quota.used, quota.limit))
     }
 }
