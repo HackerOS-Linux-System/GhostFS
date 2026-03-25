@@ -1,10 +1,13 @@
+use sled::Db;
 use crate::crypto::Crypto;
 use crate::compression::Compression;
 use crate::deduplication::Deduplication;
 use crate::versioning::Versioning;
-use sled::Db;
+use crate::error::HfsError;
+use crate::{FS_BLOCK_SIZE, ROOT_INO};
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub struct Repair {
     db: Db,
     crypto: Option<Crypto>,
@@ -14,7 +17,7 @@ pub struct Repair {
 }
 
 impl Repair {
-    pub fn new(db: &Db, crypto: &Option<Crypto>, compression: &Compression, dedup: &Deduplication, versioning: &Versioning) -> Result<Self, ()> {
+    pub fn new(db: &Db, crypto: &Option<Crypto>, compression: &Compression, dedup: &Deduplication, versioning: &Versioning) -> Result<Self, HfsError> {
         Ok(Self {
             db: db.clone(),
             crypto: crypto.clone(),
@@ -24,46 +27,63 @@ impl Repair {
         })
     }
 
-    pub fn verify_and_repair(&self, ino: u64) -> Result<bool, ()> {
-        // Sprawdza integralność inode'a i bloków, naprawia jeśli to możliwe.
-        // Zwraca true jeśli naprawiono.
-
-        // 1. Sprawdź inode
+    /// Verify the integrity of a single inode and its data blocks.
+    /// Returns `true` if any corruption was found and repaired.
+    pub fn verify_and_repair(&self, ino: u64) -> Result<bool, HfsError> {
         let inode_key = format!("inode:{}", ino);
-        let inode_data = match self.db.get(inode_key.as_bytes()).map_err(|_| ())? {
+        let inode_data = match self.db.get(inode_key.as_bytes())? {
             Some(d) => d,
-            None => return Ok(false), // brak inode'a
+            None => return Ok(false), // inode does not exist
         };
-        let inode: crate::Inode = bincode::deserialize(&inode_data).map_err(|_| ())?;
+        let inode: crate::serialization::Inode = bincode::deserialize(&inode_data)?;
 
-        // 2. Sprawdź bloki danych
+        let block_count = (inode.attr.size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64;
         let mut corrupted = false;
-        for block_idx in 0..((inode.attr.size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize {
+
+        for block_idx in 0..block_count as usize {
             let block_key = format!("data:{}:{}", ino, block_idx);
-            if let Some(block_data) = self.db.get(block_key.as_bytes()).map_err(|_| ())? {
-                // Dekompresja i deszyfrowanie
+            if let Some(encrypted) = self.db.get(block_key.as_bytes())? {
+                // Try to decrypt and decompress
                 let decrypted = if let Some(crypto) = &self.crypto {
-                    crypto.decrypt(&block_data).map_err(|_| ())?
+                    crypto.decrypt(&encrypted)?
                 } else {
-                    block_data.to_vec()
+                    encrypted.to_vec()
                 };
-                let decompressed = self.compression.decompress(&decrypted).map_err(|_| ())?;
+                let decompressed = self.compression.decompress(&decrypted)?;
+
+                // Verify integrity via dedup (hash) or direct hash
                 if let Err(_) = self.dedup.verify(ino, block_idx, &decompressed) {
                     corrupted = true;
-                    // Próba naprawy: przywróć z poprzedniej wersji
+                    // Attempt repair: restore from latest version
                     if let Ok(versions) = self.versioning.list_versions(ino) {
                         if let Some(&latest) = versions.iter().max() {
-                            if let Ok(_) = self.versioning.restore_version(ino, latest) {
-                                // Po przywróceniu wersji przerywamy, bo inode i bloki są zastąpione
+                            if self.versioning.restore_version(ino, latest).is_ok() {
+                                // Successfully restored, break and return
                                 return Ok(true);
                             }
                         }
                     }
+                    // If version restore fails, we could try to zero out the block or mark it as bad.
+                    // For now, just report corruption.
                 }
             }
         }
+
         Ok(corrupted)
     }
 
-    // Można dodać periodiczną naprawę w tle
+    /// Scan all inodes and verify/repair them.
+    pub fn scan_and_repair(&self) -> Result<(), HfsError> {
+        let prefix = "inode:";
+        for item in self.db.scan_prefix(prefix.as_bytes()) {
+            let (k, _) = item?;
+            let k_str = String::from_utf8(k.to_vec())?;
+            if let Some(ino_str) = k_str.strip_prefix(prefix) {
+                if let Ok(ino) = ino_str.parse::<u64>() {
+                    let _ = self.verify_and_repair(ino);
+                }
+            }
+        }
+        Ok(())
+    }
 }
