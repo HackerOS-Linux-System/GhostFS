@@ -6,6 +6,7 @@ use crate::error::HfsError;
 pub type Key = [u8; 32];
 const NONCE_SIZE: usize = 12;
 
+#[derive(Clone)]
 pub struct Crypto {
     cipher: Aes256Gcm,
 }
