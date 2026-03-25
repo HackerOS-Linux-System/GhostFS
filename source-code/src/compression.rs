@@ -1,6 +1,6 @@
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
-use flate2::Compression;
+use flate2::Compression as FlateCompression;
 use std::io::{Write, Read};
 use crate::error::HfsError;
 
@@ -19,6 +19,7 @@ pub enum CompressionType {
     Lz4,
 }
 
+#[derive(Clone)]
 pub struct Compression {
     typ: CompressionType,
 }
@@ -32,23 +33,28 @@ impl Compression {
         match self.typ {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zlib => {
-                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(data).map_err(|e| HfsError::CompressionError(e.to_string()))?;
-                encoder.finish().map_err(|e| HfsError::CompressionError(e.to_string()))
+                let mut encoder = ZlibEncoder::new(Vec::new(), FlateCompression::default());
+                encoder.write_all(data)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
+                encoder.finish()
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))
             }
             #[cfg(feature = "zstd")]
             CompressionType::Zstd => {
                 let mut encoder = ZstdEncoder::new(Vec::new(), 0)
-                    .map_err(|e| HfsError::CompressionError(e.to_string()))?;
-                encoder.write_all(data).map_err(|e| HfsError::CompressionError(e.to_string()))?;
-                encoder.finish().map_err(|e| HfsError::CompressionError(e.to_string()))
+                .map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                encoder.write_all(data)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
+                encoder.finish()
+                .map_err(|e| HfsError::CompressionError(e.to_string()))
             }
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
                 let mut encoder = EncoderBuilder::new()
-                    .build(Vec::new())
-                    .map_err(|e| HfsError::CompressionError(e.to_string()))?;
-                encoder.write_all(data).map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                .build(Vec::new())
+                .map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                encoder.write_all(data)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
                 let (result, _) = encoder.finish();
                 Ok(result)
             }
@@ -61,23 +67,26 @@ impl Compression {
             CompressionType::Zlib => {
                 let mut decoder = ZlibDecoder::new(data);
                 let mut result = Vec::new();
-                decoder.read_to_end(&mut result).map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                decoder.read_to_end(&mut result)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
                 Ok(result)
             }
             #[cfg(feature = "zstd")]
             CompressionType::Zstd => {
                 let mut decoder = ZstdDecoder::new(data)
-                    .map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                .map_err(|e| HfsError::CompressionError(e.to_string()))?;
                 let mut result = Vec::new();
-                decoder.read_to_end(&mut result).map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                decoder.read_to_end(&mut result)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
                 Ok(result)
             }
             #[cfg(feature = "lz4")]
             CompressionType::Lz4 => {
                 let mut decoder = Decoder::new(data)
-                    .map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                .map_err(|e| HfsError::CompressionError(e.to_string()))?;
                 let mut result = Vec::new();
-                decoder.read_to_end(&mut result).map_err(|e| HfsError::CompressionError(e.to_string()))?;
+                decoder.read_to_end(&mut result)
+                .map_err(|e: std::io::Error| HfsError::CompressionError(e.to_string()))?;
                 Ok(result)
             }
         }
