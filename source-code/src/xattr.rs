@@ -12,20 +12,17 @@ impl XAttr {
         Ok(Self { db: db.clone() })
     }
 
-    /// Get the value of an extended attribute.
     pub fn get(&self, ino: u64, name: &OsStr) -> Result<Option<Vec<u8>>, HfsError> {
         let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
         Ok(self.db.get(key.as_bytes())?.map(|v| v.to_vec()))
     }
 
-    /// Set an extended attribute (overwrites if exists).
     pub fn set(&self, ino: u64, name: &OsStr, value: &[u8]) -> Result<(), HfsError> {
         let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
         self.db.insert(key.as_bytes(), value)?;
         Ok(())
     }
 
-    /// List all extended attribute names for an inode.
     pub fn list(&self, ino: u64) -> Result<Vec<OsString>, HfsError> {
         let prefix = format!("xattr:{}:", ino);
         let mut names = Vec::new();
@@ -39,7 +36,6 @@ impl XAttr {
         Ok(names)
     }
 
-    /// Remove an extended attribute.
     pub fn remove(&self, ino: u64, name: &OsStr) -> Result<(), HfsError> {
         let key = format!("xattr:{}:{}", ino, String::from_utf8_lossy(name.as_bytes()));
         self.db.remove(key.as_bytes())?;
