@@ -4,8 +4,7 @@ use crate::compression::Compression;
 use crate::deduplication::Deduplication;
 use crate::versioning::Versioning;
 use crate::error::HfsError;
-use crate::{FS_BLOCK_SIZE, ROOT_INO};
-use std::collections::HashSet;
+use crate::FS_BLOCK_SIZE;
 
 #[derive(Clone)]
 pub struct Repair {
@@ -20,20 +19,18 @@ impl Repair {
     pub fn new(db: &Db, crypto: &Option<Crypto>, compression: &Compression, dedup: &Deduplication, versioning: &Versioning) -> Result<Self, HfsError> {
         Ok(Self {
             db: db.clone(),
-            crypto: crypto.clone(),
-            compression: compression.clone(),
-            dedup: dedup.clone(),
-            versioning: versioning.clone(),
+           crypto: crypto.clone(),
+           compression: compression.clone(),
+           dedup: dedup.clone(),
+           versioning: versioning.clone(),
         })
     }
 
-    /// Verify the integrity of a single inode and its data blocks.
-    /// Returns `true` if any corruption was found and repaired.
     pub fn verify_and_repair(&self, ino: u64) -> Result<bool, HfsError> {
         let inode_key = format!("inode:{}", ino);
         let inode_data = match self.db.get(inode_key.as_bytes())? {
             Some(d) => d,
-            None => return Ok(false), // inode does not exist
+            None => return Ok(false),
         };
         let inode: crate::serialization::Inode = bincode::deserialize(&inode_data)?;
 
@@ -43,7 +40,6 @@ impl Repair {
         for block_idx in 0..block_count as usize {
             let block_key = format!("data:{}:{}", ino, block_idx);
             if let Some(encrypted) = self.db.get(block_key.as_bytes())? {
-                // Try to decrypt and decompress
                 let decrypted = if let Some(crypto) = &self.crypto {
                     crypto.decrypt(&encrypted)?
                 } else {
@@ -51,28 +47,21 @@ impl Repair {
                 };
                 let decompressed = self.compression.decompress(&decrypted)?;
 
-                // Verify integrity via dedup (hash) or direct hash
                 if let Err(_) = self.dedup.verify(ino, block_idx, &decompressed) {
                     corrupted = true;
-                    // Attempt repair: restore from latest version
                     if let Ok(versions) = self.versioning.list_versions(ino) {
                         if let Some(&latest) = versions.iter().max() {
                             if self.versioning.restore_version(ino, latest).is_ok() {
-                                // Successfully restored, break and return
                                 return Ok(true);
                             }
                         }
                     }
-                    // If version restore fails, we could try to zero out the block or mark it as bad.
-                    // For now, just report corruption.
                 }
             }
         }
-
         Ok(corrupted)
     }
 
-    /// Scan all inodes and verify/repair them.
     pub fn scan_and_repair(&self) -> Result<(), HfsError> {
         let prefix = "inode:";
         for item in self.db.scan_prefix(prefix.as_bytes()) {
