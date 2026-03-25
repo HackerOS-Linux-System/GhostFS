@@ -1,7 +1,7 @@
 use sled::Db;
-use blake3::Hasher;
 use crate::error::HfsError;
 
+#[derive(Clone)]
 pub struct Deduplication {
     db: Db,
 }
@@ -62,7 +62,6 @@ impl Deduplication {
         let ref_key = format!("ref:{}:{}", ino, block_idx);
         if let Some(ref_value) = self.db.get(ref_key.as_bytes())? {
             let (orig_ino, orig_idx): (u64, usize) = bincode::deserialize(&ref_value)?;
-            // Verify original block's hash
             let orig_key = format!("dedup:{}:{}", orig_ino, orig_idx);
             if let Some(stored_hash) = self.db.get(orig_key.as_bytes())? {
                 let computed = blake3::hash(data);
