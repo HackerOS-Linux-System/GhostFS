@@ -22,7 +22,7 @@ impl Cache {
         }
     }
 
-    pub fn get_inode(&self, ino: u64) -> Option<Inode> {
+    pub fn get_inode(&mut self, ino: u64) -> Option<Inode> {
         if let Some(entry) = self.inodes.get(&ino) {
             self.inode_lru.put(ino, ());
             Some(entry.clone())
@@ -31,7 +31,7 @@ impl Cache {
         }
     }
 
-    pub fn put_inode(&self, ino: u64, inode: Inode) {
+    pub fn put_inode(&mut self, ino: u64, inode: Inode) {
         self.inodes.insert(ino, inode);
         self.inode_lru.put(ino, ());
         while self.inodes.len() > self.inode_lru.cap().get() {
@@ -41,12 +41,12 @@ impl Cache {
         }
     }
 
-    pub fn remove_inode(&self, ino: u64) {
+    pub fn remove_inode(&mut self, ino: u64) {
         self.inodes.remove(&ino);
         self.inode_lru.pop(&ino);
     }
 
-    pub fn get_block(&self, ino: u64, idx: usize) -> Option<Vec<u8>> {
+    pub fn get_block(&mut self, ino: u64, idx: usize) -> Option<Vec<u8>> {
         let key = (ino, idx);
         if let Some(entry) = self.blocks.get(&key) {
             self.block_lru.put(key, ());
@@ -56,7 +56,7 @@ impl Cache {
         }
     }
 
-    pub fn put_block(&self, ino: u64, idx: usize, data: Vec<u8>) {
+    pub fn put_block(&mut self, ino: u64, idx: usize, data: Vec<u8>) {
         let key = (ino, idx);
         self.blocks.insert(key, Arc::new(data));
         self.block_lru.put(key, ());
@@ -67,7 +67,7 @@ impl Cache {
         }
     }
 
-    pub fn remove_block(&self, ino: u64, idx: usize) {
+    pub fn remove_block(&mut self, ino: u64, idx: usize) {
         let key = (ino, idx);
         self.blocks.remove(&key);
         self.block_lru.pop(&key);
