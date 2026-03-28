@@ -1,4 +1,4 @@
-# hfs
+# GhostFS
 File system for HackerOS
 
 # 
