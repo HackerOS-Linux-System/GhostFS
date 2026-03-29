@@ -7,7 +7,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
     use std::time::SystemTime;
     use std::sync::atomic::Ordering;
 
-    impl Filesystem for HFS {
+    impl Filesystem for GhostFS {
         fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
             match self.lookup_name(parent, name) {
                 Ok(Some(ino)) => {
@@ -113,10 +113,9 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                        };
                        let inode = serialization::Inode { attr: attr.into(), parent };
 
-                       // Pobierz rodzica przed rozpoczęciem transakcji
                        let parent_inode = self.get_inode(parent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
                            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                            batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
@@ -164,7 +163,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
 
                        let parent_inode = self.get_inode(parent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
                            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                            batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
@@ -208,7 +207,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                            let hash_prefix = format!("hash:{}:", ino);
                            let ref_prefix = format!("ref:{}:", ino);
                            let xattr_prefix = format!("xattr:{}:", ino);
-                           if let Err(e) = self.with_batch(|batch| {
+                           if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                                batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                                batch.remove(format!("inode:{}", ino).as_bytes());
                                for item in self.db.scan_prefix(data_prefix.as_bytes()) {
@@ -239,7 +238,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                                return;
                            }
                        } else {
-                           if let Err(e) = self.with_batch(|batch| {
+                           if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                                batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                                if let Some(mut parent_inode) = parent_inode {
@@ -277,7 +276,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                        }
                        let parent_inode = self.get_inode(parent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                            batch.remove(format!("inode:{}", ino).as_bytes());
                            if let Some(mut parent_inode) = parent_inode {
@@ -326,7 +325,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
 
                        let parent_inode = self.get_inode(parent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
                            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                            batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
@@ -352,9 +351,10 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                                reply.error(ENOENT);
                                return;
                            }
-                           match self.db.get(format!("data:{}:0", ino).as_bytes()) {
-                               Ok(Some(data)) => reply.data(&data),
-                               _ => reply.error(EIO),
+                           if let Ok(Some(data)) = self.db.get(format!("data:{}:0", ino).as_bytes()) {
+                               reply.data(&data);
+                           } else {
+                               reply.error(EIO);
                            }
                        } else {
                            reply.error(ENOENT);
@@ -378,7 +378,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                        inode.attr.nlink += 1;
                        let newparent_inode = self.get_inode(newparent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                            batch.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
                            if let Some(mut newparent_inode) = newparent_inode {
@@ -415,7 +415,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                        let old_parent = self.get_inode(parent).ok().flatten();
                        let new_parent = self.get_inode(newparent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                            batch.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
                            if parent != newparent && kind == fuser::FileType::Directory {
@@ -558,7 +558,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
 
                        let parent_inode = self.get_inode(parent).ok().flatten();
 
-                       if let Err(e) = self.with_batch(|batch| {
+                       if let Err(e) = self.with_batch(|batch: &mut sled::Batch| {
                            batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
                            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
                            batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
@@ -644,7 +644,7 @@ use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirector
                            Ok(names) => {
                                let mut data = Vec::new();
                                for name in names {
-                                   data.extend_from_slice(name.as_bytes());
+                                   data.extend_from_slice(name.as_encoded_bytes());
                                    data.push(0);
                                }
                                if size == 0 {
