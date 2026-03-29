@@ -2,4 +2,18 @@
 // libfuse3-dev
 
 > cd source-code
-> cargo build --release
+cargo build --release --features normal
+! lub cargo build --release --no-default-features --features normal,zstd,lz4
+! dla cybersec:
+! cargo build --release --features cybersec
+! cargo build --release --no-default-features --features cybersec,zstd,lz4
+
+! uzywanie wersji normalnej: Tworzenie systemu plików (opcjonalne szyfrowanie)
+! ./target/release/hfs mkfs --device /path/to/db --encryption false
+! Montowanie (szyfrowanie opcjonalne)
+! ./target/release/hfs mount --device /path/to/db --mountpoint /mnt/hfs --cybersecurity false
+
+! uzywanie wersji cybersec: Tworzenie systemu plików (wymuszone szyfrowanie)
+! ./target/release/hfs mkfs --device /path/to/db
+! Montowanie (wymuszone szyfrowanie z kluczem)
+! ./target/release/hfs mount --device /path/to/db --mountpoint /mnt/hfs --key-file key.txt
