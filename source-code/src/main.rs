@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
-use hfs::HFS;
+use ghostfs::GhostFS;          // ← poprawny import – nazwa crate'a małymi literami
 use std::path::PathBuf;
 use fuser::MountOption;
 
 #[derive(Parser)]
-#[command(name = "hfs")]
-#[command(about = "HackerOS File System", long_about = None)]
+#[command(name = "ghostfs")]
+#[command(about = "GhostFS - File System for HackerOS", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -13,40 +13,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Mount an HFS filesystem
     Mount {
         #[arg(short, long)]
-        device: PathBuf,   // ścieżka do bazy danych sled
-
+        device: PathBuf,
         #[arg(short, long)]
         mountpoint: PathBuf,
-
+        #[cfg(feature = "cybersec")]
+        #[arg(long, default_value_t = true)]
+        cybersecurity: bool,
+        #[cfg(feature = "normal")]
         #[arg(long)]
         cybersecurity: bool,
-
         #[arg(long)]
         key_file: Option<PathBuf>,
-
         #[arg(long)]
-        compression: Option<String>,  // "zlib", "none"
-
+        compression: Option<String>,
         #[arg(long)]
         noatime: bool,
     },
-
-    /// Create a new HFS filesystem
     Mkfs {
         #[arg(short, long)]
         device: PathBuf,
-
         #[arg(long)]
         encryption: bool,
-
         #[arg(long)]
         block_size: Option<u32>,
     },
-
-    /// Unmount an HFS filesystem
     Umount {
         #[arg(short, long)]
         mountpoint: PathBuf,
@@ -59,6 +51,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Mount { device, mountpoint, cybersecurity, key_file, compression, noatime } => {
+            #[cfg(feature = "cybersec")]
+            let key = {
+                if let Some(kf) = key_file {
+                    let key_hex = std::fs::read_to_string(kf)?;
+                    let key_bytes = hex::decode(key_hex.trim())?;
+                    if key_bytes.len() != 32 {
+                        eprintln!("Key must be 32 bytes");
+                        std::process::exit(1);
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&key_bytes);
+                    Some(arr)
+                } else {
+                    eprintln!("Key file required for cybersecurity mode");
+                    std::process::exit(1);
+                }
+            };
+
+            #[cfg(feature = "normal")]
             let key = if cybersecurity {
                 if let Some(kf) = key_file {
                     let key_hex = std::fs::read_to_string(kf)?;
@@ -78,24 +89,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let fs = HFS::new(&device, cybersecurity, key, compression, noatime)?;
+            let fs = GhostFS::new(&device, cybersecurity, key, compression, noatime)?;
             let options = vec![
                 MountOption::RW,
-                MountOption::FSName("hfs".to_string()),
+                MountOption::FSName("ghostfs".to_string()),
                 MountOption::AutoUnmount,
             ];
             fuser::mount2(fs, &mountpoint, &options)?;
         }
         Commands::Mkfs { device, encryption, block_size } => {
-            hfs::format(&device, encryption, block_size)?;
+            ghostfs::format(&device, encryption, block_size)?;   // ← poprawna ścieżka do funkcji format
         }
         Commands::Umount { mountpoint } => {
-            // Użyj fusermount -u
             std::process::Command::new("fusermount")
-                .args(&["-u", mountpoint.to_str().unwrap()])
-                .status()?;
+            .args(&["-u", mountpoint.to_str().unwrap()])
+            .status()?;
         }
     }
-
     Ok(())
-                              }
+}
