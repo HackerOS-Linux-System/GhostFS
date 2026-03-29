@@ -14,7 +14,6 @@ pub mod fs;
 use std::path::Path;
 use sled::Db;
 use anyhow::{Context, Result};
-use crate::crypto::{Crypto, Key};
 use crate::compression::{Compression, CompressionType};
 use crate::deduplication::Deduplication;
 use crate::versioning::Versioning;
@@ -30,14 +29,26 @@ use crossbeam::channel::Sender;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
+#[cfg(feature = "cybersec")]
+use crate::crypto::{Crypto, Key};
+
+#[cfg(feature = "normal")]
+use crate::crypto::{Crypto, Key};
+
 pub const FS_BLOCK_SIZE: u32 = 4096;
 pub const ROOT_INO: u64 = 1;
 pub const TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
-pub struct HFS {
+pub struct GhostFS {
     pub(crate) db: Db,
     pub(crate) next_ino: AtomicU64,
+
+    #[cfg(feature = "cybersec")]
+    pub(crate) crypto: Crypto,
+
+    #[cfg(feature = "normal")]
     pub(crate) crypto: Option<Crypto>,
+
     pub(crate) compression: Compression,
     pub(crate) dedup: Deduplication,
     pub(crate) versioning: Versioning,
@@ -50,11 +61,21 @@ pub struct HFS {
     pub(crate) background_repair_sender: Option<Sender<()>>,
 }
 
-impl HFS {
+impl GhostFS {
     pub fn new(db_path: &Path, cybersecurity: bool, key: Option<Key>, compression_type: Option<String>, noatime: bool) -> Result<Self> {
         let db = sled::open(db_path)
-            .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
+        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
+        #[cfg(feature = "cybersec")]
+        let crypto = {
+            if !cybersecurity {
+                return Err(anyhow::anyhow!("This build requires cybersecurity mode (--features cybersec)"));
+            }
+            let key = key.ok_or_else(|| anyhow::anyhow!("Cybersecurity mode requires a key"))?;
+            Crypto::new(key)?
+        };
+
+        #[cfg(feature = "normal")]
         let crypto = if cybersecurity {
             let key = key.ok_or_else(|| anyhow::anyhow!("Cybersecurity mode requires a key"))?;
             Some(Crypto::new(key)?)
@@ -64,11 +85,11 @@ impl HFS {
 
         let compression = Compression::new(match compression_type.as_deref() {
             Some("zlib") => CompressionType::Zlib,
-            #[cfg(feature = "zstd")]
-            Some("zstd") => CompressionType::Zstd,
-            #[cfg(feature = "lz4")]
-            Some("lz4") => CompressionType::Lz4,
-            _ => CompressionType::None,
+                                           #[cfg(feature = "zstd")]
+                                           Some("zstd") => CompressionType::Zstd,
+                                           #[cfg(feature = "lz4")]
+                                           Some("lz4") => CompressionType::Lz4,
+                                           _ => CompressionType::None,
         });
 
         let dedup = Deduplication::new(&db)?;
@@ -76,7 +97,13 @@ impl HFS {
         let audit = Audit::new(&db)?;
         let quota = Quota::new(&db)?;
         let xattr = XAttr::new(&db)?;
+
+        #[cfg(feature = "cybersec")]
+        let repair = Repair::new(&db, &Some(crypto.clone()), &compression, &dedup, &versioning)?;
+
+        #[cfg(feature = "normal")]
         let repair = Repair::new(&db, &crypto, &compression, &dedup, &versioning)?;
+
         let cache = Cache::new();
 
         let next_ino = match db.get(b"next_ino")? {
@@ -103,7 +130,7 @@ impl HFS {
                 };
                 batch.insert(
                     format!("inode:{}", ROOT_INO).as_bytes(),
-                    bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
+                        bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
                 );
                 db.apply_batch(batch)?;
                 ROOT_INO + 1
@@ -124,21 +151,21 @@ impl HFS {
         Ok(Self {
             db,
             next_ino: AtomicU64::new(next_ino),
-            crypto,
-            compression,
-            dedup,
-            versioning,
-            audit,
-            quota,
-            xattr,
-            repair,
-            cache,
-            noatime,
-            background_repair_sender: Some(tx),
+           crypto,
+           compression,
+           dedup,
+           versioning,
+           audit,
+           quota,
+           xattr,
+           repair,
+           cache,
+           noatime,
+           background_repair_sender: Some(tx),
         })
     }
 
-    // ------------------- Helper methods (all require &mut self due to cache) -------------------
+    // ---------- Helper methods (wszystkie dostępne dla modułu fs) ----------
     pub(crate) fn get_inode(&mut self, ino: u64) -> Result<Option<Inode>, HfsError> {
         if let Some(cached) = self.cache.get_inode(ino) {
             return Ok(Some(cached));
@@ -198,6 +225,9 @@ impl HFS {
             Some(data) => data.to_vec(),
             None => return Ok(vec![0u8; FS_BLOCK_SIZE as usize]),
         };
+        #[cfg(feature = "cybersec")]
+        let decrypted = self.crypto.decrypt(&encrypted)?;
+        #[cfg(feature = "normal")]
         let decrypted = if let Some(crypto) = &self.crypto {
             crypto.decrypt(&encrypted)?
         } else {
@@ -215,6 +245,9 @@ impl HFS {
             return Ok(());
         }
         let compressed = self.compression.compress(data)?;
+        #[cfg(feature = "cybersec")]
+        let encrypted = self.crypto.encrypt(&compressed)?;
+        #[cfg(feature = "normal")]
         let encrypted = if let Some(crypto) = &self.crypto {
             crypto.encrypt(&compressed)?
         } else {
@@ -276,7 +309,7 @@ impl HFS {
             }
             let bytes_to_write = (FS_BLOCK_SIZE as usize - block_start).min(data.len() - pos);
             block[block_start..block_start + bytes_to_write]
-                .copy_from_slice(&data[pos..pos + bytes_to_write]);
+            .copy_from_slice(&data[pos..pos + bytes_to_write]);
             self.put_block(ino, block_idx, &block)?;
             pos += bytes_to_write;
         }
@@ -346,7 +379,7 @@ impl HFS {
 
     pub(crate) fn with_batch<F>(&self, f: F) -> Result<(), HfsError>
     where
-        F: FnOnce(&mut sled::Batch) -> Result<(), HfsError>,
+    F: FnOnce(&mut sled::Batch) -> Result<(), HfsError>,
     {
         let mut batch = sled::Batch::default();
         f(&mut batch)?;
@@ -355,8 +388,8 @@ impl HFS {
     }
 }
 
-// Public API for filesystem creation
-pub fn format(db_path: &Path, encryption: bool, block_size: Option<u32>) -> Result<(), HfsError> {
+// Public API do formatowania
+pub fn format(db_path: &Path, _encryption: bool, block_size: Option<u32>) -> Result<(), HfsError> {
     let db = sled::open(db_path)?;
     let mut batch = sled::Batch::default();
     batch.insert(b"next_ino", bincode::serialize(&(ROOT_INO + 1))?);
@@ -380,7 +413,7 @@ pub fn format(db_path: &Path, encryption: bool, block_size: Option<u32>) -> Resu
     let inode = Inode { attr: root_attr.into(), parent: 0 };
     batch.insert(
         format!("inode:{}", ROOT_INO).as_bytes(),
-        bincode::serialize(&inode)?,
+            bincode::serialize(&inode)?,
     );
     db.apply_batch(batch)?;
     db.flush()?;
