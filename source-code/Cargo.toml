@@ -1,7 +1,11 @@
 [package]
-name = "hfs"
-version = "0.2.0"
+name = "ghostfs"
+version = "0.3.0"
 edition = "2021"
+
+[[bin]]
+name = "ghostfs"
+path = "src/main.rs"
 
 [dependencies]
 fuser = "0.15"
@@ -24,11 +28,12 @@ crossbeam = "0.8"
 thiserror = "1.0"
 anyhow = "1.0"
 
-# Optional compression backends
 zstd = { version = "0.13", optional = true }
 lz4 = { version = "1.24", optional = true }
 
 [features]
-default = ["zstd", "lz4"]
+default = ["zstd", "lz4", "normal"]
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4"]
+normal = []
+cybersec = []
