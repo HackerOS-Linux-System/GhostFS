@@ -1,0 +1,7 @@
+*.conf linguist-detectable=true
+*.conf linguist-documentation=false
+*.conf linguist-language=YAML
+
+*.toml linguist-detectable=true
+*.toml linguist-documentation=false
+*.toml linguist-language=TOML
