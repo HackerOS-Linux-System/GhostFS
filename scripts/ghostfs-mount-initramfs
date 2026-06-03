@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# /etc/initramfs-tools/scripts/local-top/ghostfs-mount
+# Initramfs BOOT script — mounts the GhostFS root partition before
+# pivot_root hands control to the init system.
+#
+# Install:
+#   cp ghostfs-mount /etc/initramfs-tools/scripts/local-top/ghostfs-mount
+#   chmod +x /etc/initramfs-tools/scripts/local-top/ghostfs-mount
+#   update-initramfs -u
+#
+# Kernel command-line parameters consumed:
+#   ghostfs.device=<path>       — block device or image (required)
+#   ghostfs.cybersec=1          — enable cybersec mode
+#   ghostfs.keyfile=<path>      — path to key file inside initramfs
+#   ghostfs.compression=<algo>  — zstd (default) | lz4 | zlib | none
+#   ghostfs.noatime=1           — enable noatime (default: 1)
+
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+# ── Parse kernel command line ────────────────────────────────────────────────
+GHOSTFS_DEVICE=""
+GHOSTFS_CYBERSEC=0
+GHOSTFS_KEYFILE="/etc/ghostfs/key.hex"
+GHOSTFS_COMPRESSION="zstd"
+GHOSTFS_NOATIME=1
+
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        ghostfs.device=*)      GHOSTFS_DEVICE="${param#ghostfs.device=}" ;;
+        ghostfs.cybersec=*)    GHOSTFS_CYBERSEC="${param#ghostfs.cybersec=}" ;;
+        ghostfs.keyfile=*)     GHOSTFS_KEYFILE="${param#ghostfs.keyfile=}" ;;
+        ghostfs.compression=*) GHOSTFS_COMPRESSION="${param#ghostfs.compression=}" ;;
+        ghostfs.noatime=*)     GHOSTFS_NOATIME="${param#ghostfs.noatime=}" ;;
+    esac
+done
+
+if [[ -z "$GHOSTFS_DEVICE" ]]; then
+    # Not a GhostFS boot — exit silently
+    exit 0
+fi
+
+log_begin_msg "GhostFS: mounting root from $GHOSTFS_DEVICE"
+
+# ── Load FUSE ─────────────────────────────────────────────────────────────────
+modprobe fuse 2>/dev/null || true
+[[ -e /dev/fuse ]] || mknod /dev/fuse c 10 229
+
+# ── Wait for device ───────────────────────────────────────────────────────────
+for i in $(seq 1 20); do
+    [[ -e "$GHOSTFS_DEVICE" ]] && break
+    sleep 0.5
+done
+[[ -e "$GHOSTFS_DEVICE" ]] || { log_failure_msg "GhostFS: device $GHOSTFS_DEVICE not found"; exit 1; }
+
+# ── Build mount arguments ─────────────────────────────────────────────────────
+ARGS=(mount --device "$GHOSTFS_DEVICE" --mountpoint "${rootmnt}" \
+      --compression "$GHOSTFS_COMPRESSION")
+
+[[ "$GHOSTFS_NOATIME" == "1" ]] && ARGS+=(--noatime)
+
+if [[ "$GHOSTFS_CYBERSEC" == "1" ]]; then
+    [[ -f "$GHOSTFS_KEYFILE" ]] || { log_failure_msg "GhostFS: key file $GHOSTFS_KEYFILE missing"; exit 1; }
+    ARGS+=(--cybersecurity --key-file "$GHOSTFS_KEYFILE")
+fi
+
+# ── Mount ─────────────────────────────────────────────────────────────────────
+/usr/local/bin/ghostfs "${ARGS[@]}" &
+GPID=$!
+
+# Wait up to 10 seconds for the FUSE mount to appear
+for i in $(seq 1 20); do
+    mount | grep -q "${rootmnt}" && break
+    sleep 0.5
+done
+
+if ! mount | grep -q "${rootmnt}"; then
+    kill "$GPID" 2>/dev/null || true
+    log_failure_msg "GhostFS: mount timed out"
+    exit 1
+fi
+
+log_end_msg 0
