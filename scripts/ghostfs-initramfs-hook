@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# /etc/initramfs-tools/hooks/ghostfs
+# Initramfs hook — bundles ghostfs binary + libfuse into the initramfs so the
+# root filesystem can be mounted by ghostfs before the init system pivots root.
+#
+# Install:
+#   cp ghostfs-initramfs-hook /etc/initramfs-tools/hooks/ghostfs
+#   chmod +x /etc/initramfs-tools/hooks/ghostfs
+#   update-initramfs -u
+#
+# This hook runs at initramfs BUILD time (not at boot time).
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# ── Copy the ghostfs binary ──────────────────────────────────────────────────
+GHOSTFS_BIN="$(command -v ghostfs 2>/dev/null || echo /usr/local/bin/ghostfs)"
+if [[ ! -x "$GHOSTFS_BIN" ]]; then
+    echo "ghostfs initramfs hook: binary not found at $GHOSTFS_BIN — skipping" >&2
+    exit 0
+fi
+
+copy_exec "$GHOSTFS_BIN" /usr/local/bin/ghostfs
+
+# ── Copy FUSE libraries ──────────────────────────────────────────────────────
+for lib in libfuse3.so.3 libfuse.so.2; do
+    found=$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1==l{print $NF; exit}')
+    [[ -n "$found" ]] && copy_exec "$found"
+done
+
+# ── Copy the key file if configured ─────────────────────────────────────────
+KEY_FILE="${GHOSTFS_KEY_FILE:-/etc/ghostfs/key.hex}"
+if [[ -f "$KEY_FILE" ]]; then
+    mkdir -p "${DESTDIR}/etc/ghostfs"
+    cp "$KEY_FILE" "${DESTDIR}/etc/ghostfs/key.hex"
+    chmod 600 "${DESTDIR}/etc/ghostfs/key.hex"
+    echo "ghostfs initramfs hook: bundled key file"
+fi
+
+# ── Ensure the fuse kernel module is included ─────────────────────────────────
+manual_add_modules fuse
+force_load fuse
