@@ -1,4 +1,3 @@
-
 use sled::Db;
 use serde::{Serialize, Deserialize};
 use crate::error::HfsError;
