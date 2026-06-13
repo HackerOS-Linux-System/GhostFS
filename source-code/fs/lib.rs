@@ -1,27 +1,38 @@
-pub mod crypto;
-pub mod compression;
-pub mod deduplication;
-pub mod versioning;
-pub mod audit;
-pub mod quota;
-pub mod xattr;
-pub mod repair;
-pub mod cache;
-pub mod error;
-pub mod serialization;
-pub mod fs;
-pub mod journal;
-pub mod extents;
-pub mod dirindex;
+// ── core ─────────────────────────────────────────────────────────────────────
+#[path = "../core/error.rs"]        pub mod error;
+#[path = "../core/serialization.rs"]pub mod serialization;
+#[path = "../core/cache.rs"]        pub mod cache;
+#[path = "../core/journal.rs"]      pub mod journal;
 
-#[cfg(feature = "cybersec")]
-pub mod integrity;
-#[cfg(feature = "cybersec")]
-pub mod mac;
-#[cfg(feature = "cybersec")]
-pub mod ids;
-#[cfg(feature = "cybersec")]
-pub mod forensics;
+// ── fs ───────────────────────────────────────────────────────────────────────
+#[path = "fs.rs"]                   pub mod fs;
+#[path = "extents.rs"]              pub mod extents;
+#[path = "dirindex.rs"]             pub mod dirindex;
+#[path = "xattr.rs"]                pub mod xattr;
+
+// ── data ─────────────────────────────────────────────────────────────────────
+#[path = "../data/compression.rs"]  pub mod compression;
+#[path = "../data/deduplication.rs"]pub mod deduplication;
+#[path = "../data/versioning.rs"]   pub mod versioning;
+#[path = "../data/repair.rs"]       pub mod repair;
+
+// ── audit ────────────────────────────────────────────────────────────────────
+#[path = "../audit/audit.rs"]       pub mod audit;
+#[path = "../audit/quota.rs"]       pub mod quota;
+
+// ── security ─────────────────────────────────────────────────────────────────
+#[path = "../security/crypto.rs"]       pub mod crypto;
+#[path = "../security/integrity.rs"]    pub mod integrity;
+#[path = "../security/mac.rs"]          pub mod mac;
+#[path = "../security/ids.rs"]          pub mod ids;
+#[path = "../security/forensics.rs"]    pub mod forensics;
+#[path = "../security/kdf.rs"]          pub mod kdf;
+#[path = "../security/superblock.rs"]   pub mod superblock;
+#[path = "../security/secure_delete.rs"]pub mod secure_delete;
+#[path = "../security/rate_limit.rs"]   pub mod rate_limit;
+
+pub use error::HfsError;
+pub use crypto::Key;
 
 use std::path::Path;
 use sled::Db;
@@ -34,106 +45,72 @@ use crate::quota::Quota;
 use crate::xattr::XAttr;
 use crate::repair::Repair;
 use crate::cache::Cache;
-use crate::error::HfsError;
-use crate::serialization::Inode;
 use crate::journal::Journal;
 use crate::extents::ExtentTree;
 use crate::dirindex::DirIndex;
+use crate::crypto::Crypto;
+use crate::integrity::IntegrityTree;
+use crate::mac::MacLabels;
+use crate::ids::Ids;
+use crate::forensics::Forensics;
+use crate::secure_delete::SecureDelete;
+use crate::rate_limit::RateLimiter;
+use crate::superblock::Superblock;
 use std::sync::atomic::AtomicU64;
 use crossbeam::channel::Sender;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
-#[cfg(feature = "cybersec")]
-use crate::crypto::{Crypto, Key};
-#[cfg(feature = "cybersec")]
-use crate::integrity::IntegrityTree;
-#[cfg(feature = "cybersec")]
-use crate::mac::MacLabels;
-#[cfg(feature = "cybersec")]
-use crate::ids::Ids;
-#[cfg(feature = "cybersec")]
-use crate::forensics::Forensics;
-
-#[cfg(feature = "normal")]
-use crate::crypto::{Crypto, Key};
-
 pub const FS_BLOCK_SIZE: u32 = 4096;
-pub const ROOT_INO: u64 = 1;
+pub const ROOT_INO: u64      = 1;
 pub const TTL: std::time::Duration = std::time::Duration::from_secs(1);
-pub const DIR_INDEX_SPLIT_THRESHOLD: usize = 128;
 
 pub struct GhostFS {
-    pub(crate) db: Db,
-    pub(crate) next_ino: AtomicU64,
-
-    #[cfg(feature = "cybersec")]
-    pub(crate) crypto: Crypto,
-    #[cfg(feature = "normal")]
-    pub(crate) crypto: Option<Crypto>,
-
+    pub(crate) db:          Db,
+    pub(crate) next_ino:    AtomicU64,
+    pub(crate) crypto:      Crypto,
+    pub(crate) integrity:   IntegrityTree,
+    pub(crate) mac:         MacLabels,
+    pub(crate) ids:         Ids,
+    pub(crate) forensics:   Forensics,
+    pub(crate) secure_del:  SecureDelete,
+    pub         rate_limit: RateLimiter,
     pub(crate) compression: Compression,
-    pub(crate) dedup: Deduplication,
-    pub(crate) versioning: Versioning,
-    pub(crate) audit: Audit,
-    pub(crate) quota: Quota,
-    pub(crate) xattr: XAttr,
-    pub(crate) repair: Repair,
-    pub(crate) cache: Cache,
-    pub(crate) noatime: bool,
+    pub(crate) dedup:       Deduplication,
+    pub(crate) versioning:  Versioning,
+    pub(crate) audit:       Audit,
+    pub(crate) quota:       Quota,
+    pub(crate) xattr:       XAttr,
+    #[allow(dead_code)]
+    pub(crate) repair:      Repair,
+    pub(crate) cache:       Cache,
+    pub(crate) journal:     Journal,
+    pub(crate) extents:     ExtentTree,
+    pub(crate) dirindex:    DirIndex,
+    pub(crate) noatime:     bool,
+    #[allow(dead_code)]
     pub(crate) background_repair_sender: Option<Sender<()>>,
-
-    pub(crate) journal: Journal,
-    pub(crate) extents: ExtentTree,
-    pub(crate) dirindex: DirIndex,
-
-    #[cfg(feature = "cybersec")]
-    pub(crate) integrity: IntegrityTree,
-    #[cfg(feature = "cybersec")]
-    pub(crate) mac: MacLabels,
-    #[cfg(feature = "cybersec")]
-    pub(crate) ids: Ids,
-    #[cfg(feature = "cybersec")]
-    pub(crate) forensics: Forensics,
 }
 
 impl GhostFS {
     pub fn new(
-        db_path: &Path,
-        cybersecurity: bool,
-        key: Option<Key>,
+        db_path:          &Path,
+        key:              Key,
         compression_type: Option<String>,
-        noatime: bool,
+        noatime:          bool,
     ) -> Result<Self> {
         let db = sled::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
-        #[cfg(feature = "cybersec")]
-        let crypto = {
-            if !cybersecurity {
-                return Err(anyhow::anyhow!(
-                    "This build requires cybersecurity mode (--features cybersec)"
-                ));
-            }
-            let key = key.ok_or_else(|| anyhow::anyhow!("Cybersecurity mode requires a key"))?;
-            Crypto::new(key)?
-        };
-
-        #[cfg(feature = "normal")]
-        let crypto = if cybersecurity {
-            let key = key.ok_or_else(|| anyhow::anyhow!("Cybersecurity mode requires a key"))?;
-            Some(Crypto::new(key)?)
-        } else {
-            None
-        };
+        let crypto = Crypto::new(key)?;
 
         let compression = Compression::new(match compression_type.as_deref() {
             Some("zlib") => CompressionType::Zlib,
                                            #[cfg(feature = "zstd")]
                                            Some("zstd") => CompressionType::Zstd,
                                            #[cfg(feature = "lz4")]
-                                           Some("lz4") => CompressionType::Lz4,
-                                           _ => CompressionType::None,
+                                           Some("lz4")  => CompressionType::Lz4,
+                                           _            => CompressionType::None,
         });
 
         let dedup      = Deduplication::new(&db)?;
@@ -144,22 +121,14 @@ impl GhostFS {
         let journal    = Journal::new(&db)?;
         let extents    = ExtentTree::new(&db)?;
         let dirindex   = DirIndex::new(&db)?;
-
-        #[cfg(feature = "cybersec")]
-        let repair = Repair::new(&db, &Some(crypto.clone()), &compression, &dedup, &versioning)?;
-        #[cfg(feature = "normal")]
-        let repair = Repair::new(&db, &crypto, &compression, &dedup, &versioning)?;
-
-        #[cfg(feature = "cybersec")]
-        let integrity = IntegrityTree::new(&db)?;
-        #[cfg(feature = "cybersec")]
-        let mac = MacLabels::new(&db)?;
-        #[cfg(feature = "cybersec")]
-        let ids = Ids::new(&db)?;
-        #[cfg(feature = "cybersec")]
-        let forensics = Forensics::new(&db)?;
-
-        let cache = Cache::new();
+        let integrity  = IntegrityTree::new(&db)?;
+        let mac        = MacLabels::new(&db)?;
+        let ids        = Ids::new(&db)?;
+        let forensics  = Forensics::new(&db)?;
+        let secure_del = SecureDelete::new(&db)?;
+        let rate_limit = RateLimiter::new();
+        let repair     = Repair::new(&db, &Some(crypto.clone()), &compression, &dedup, &versioning)?;
+        let cache      = Cache::new();
 
         let next_ino = match db.get(b"next_ino")? {
             Some(v) => bincode::deserialize(&v)?,
@@ -168,17 +137,15 @@ impl GhostFS {
                 batch.insert(b"next_ino", bincode::serialize(&(ROOT_INO + 1))?);
                 let root_attr = fuser::FileAttr {
                     ino: ROOT_INO, size: 0, blocks: 0,
-                    atime: std::time::UNIX_EPOCH,
-                    mtime: std::time::UNIX_EPOCH,
-                    ctime: std::time::UNIX_EPOCH,
-                    crtime: std::time::UNIX_EPOCH,
+                    atime: std::time::UNIX_EPOCH, mtime: std::time::UNIX_EPOCH,
+                    ctime: std::time::UNIX_EPOCH, crtime: std::time::UNIX_EPOCH,
                     kind: fuser::FileType::Directory,
                     perm: 0o755, nlink: 2, uid: 0, gid: 0,
                     rdev: 0, blksize: FS_BLOCK_SIZE, flags: 0,
                 };
                 batch.insert(
                     format!("inode:{}", ROOT_INO).as_bytes(),
-                        bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
+                        bincode::serialize(&serialization::Inode { attr: root_attr.into(), parent: 0 })?,
                 );
                 db.apply_batch(batch)?;
                 ROOT_INO + 1
@@ -200,27 +167,27 @@ impl GhostFS {
 
         Ok(Self {
             db, next_ino: AtomicU64::new(next_ino),
-           crypto, compression, dedup, versioning,
-           audit, quota, xattr, repair, cache, noatime,
+           crypto, integrity, mac, ids, forensics, secure_del, rate_limit,
+           compression, dedup, versioning, audit, quota, xattr,
+           repair, cache, noatime,
            background_repair_sender: Some(tx),
            journal, extents, dirindex,
-           #[cfg(feature = "cybersec")]
-           integrity,
-           #[cfg(feature = "cybersec")]
-           mac,
-           #[cfg(feature = "cybersec")]
-           ids,
-           #[cfg(feature = "cybersec")]
-           forensics,
         })
     }
 
-    pub(crate) fn get_inode(&mut self, ino: u64) -> Result<Option<Inode>, HfsError> {
+    pub fn zeroize_keys(&mut self) {
+        self.crypto.zeroize();
+        log::info!("GhostFS: cryptographic keys zeroed from memory");
+    }
+
+    // ── Inode ops ─────────────────────────────────────────────────────────────
+
+    pub(crate) fn get_inode(&mut self, ino: u64) -> Result<Option<serialization::Inode>, HfsError> {
         if let Some(cached) = self.cache.get_inode(ino) { return Ok(Some(cached)); }
         let key = format!("inode:{}", ino);
         match self.db.get(key.as_bytes())? {
             Some(bytes) => {
-                let inode: Inode = bincode::deserialize(&bytes)?;
+                let inode: serialization::Inode = bincode::deserialize(&bytes)?;
                 self.cache.put_inode(ino, inode.clone());
                 Ok(Some(inode))
             }
@@ -228,18 +195,10 @@ impl GhostFS {
         }
     }
 
-    pub(crate) fn put_inode(&mut self, ino: u64, inode: &Inode) -> Result<(), HfsError> {
+    pub(crate) fn put_inode(&mut self, ino: u64, inode: &serialization::Inode) -> Result<(), HfsError> {
         let key = format!("inode:{}", ino);
         self.db.insert(key.as_bytes(), bincode::serialize(inode)?)?;
         self.cache.put_inode(ino, inode.clone());
-        Ok(())
-    }
-
-    pub(crate) fn delete_inode(&mut self, ino: u64) -> Result<(), HfsError> {
-        let key = format!("inode:{}", ino);
-        self.db.remove(key.as_bytes())?;
-        self.cache.remove_inode(ino);
-        self.extents.remove_all(ino)?;
         Ok(())
     }
 
@@ -252,45 +211,21 @@ impl GhostFS {
         }
     }
 
-    pub(crate) fn insert_name(&self, parent: u64, name: &OsStr, ino: u64) -> Result<(), HfsError> {
-        let key = format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes()));
-        self.db.insert(key.as_bytes(), bincode::serialize(&ino)?)?;
-        self.dirindex.insert(parent, name, ino)?;
-        Ok(())
-    }
-
-    pub(crate) fn delete_name(&self, parent: u64, name: &OsStr) -> Result<(), HfsError> {
-        let key = format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes()));
-        self.db.remove(key.as_bytes())?;
-        self.dirindex.remove(parent, name)?;
-        Ok(())
-    }
+    // ── Block ops ─────────────────────────────────────────────────────────────
 
     pub(crate) fn get_block(&mut self, ino: u64, block_idx: usize) -> Result<Vec<u8>, HfsError> {
         if let Some(cached) = self.cache.get_block(ino, block_idx) { return Ok(cached); }
         let physical_key = self.extents.resolve(ino, block_idx)
         .unwrap_or_else(|| format!("data:{}:{}", ino, block_idx));
-
-        let encrypted = match self.db.get(physical_key.as_bytes())? {
+        let raw = match self.db.get(physical_key.as_bytes())? {
             Some(data) => data.to_vec(),
             None       => return Ok(vec![0u8; FS_BLOCK_SIZE as usize]),
         };
-
-        #[cfg(feature = "cybersec")]
-        let decrypted = self.crypto.decrypt(&encrypted)?;
-        #[cfg(feature = "normal")]
-        let decrypted = if let Some(crypto) = &self.crypto {
-            crypto.decrypt(&encrypted)?
-        } else {
-            encrypted
-        };
-
+        let fek          = self.crypto.derive_fek(ino);
+        let decrypted    = self.crypto.decrypt_with_key(&fek, &raw)?;
         let decompressed = self.compression.decompress(&decrypted)?;
         self.dedup.verify(ino, block_idx, &decompressed)?;
-
-        #[cfg(feature = "cybersec")]
         self.integrity.verify_block(ino, block_idx, &decompressed)?;
-
         self.cache.put_block(ino, block_idx, decompressed.clone());
         Ok(decompressed)
     }
@@ -300,39 +235,33 @@ impl GhostFS {
             self.dedup.add_reference(ino, block_idx, orig_ino, orig_idx)?;
             return Ok(());
         }
+        let fek        = self.crypto.derive_fek(ino);
         let compressed = self.compression.compress(data)?;
-        #[cfg(feature = "cybersec")]
-        let encrypted = self.crypto.encrypt(&compressed)?;
-        #[cfg(feature = "normal")]
-        let encrypted = if let Some(crypto) = &self.crypto {
-            crypto.encrypt(&compressed)?
-        } else {
-            compressed
-        };
-        let key = format!("data:{}:{}", ino, block_idx);
+        let encrypted  = self.crypto.encrypt_with_key(&fek, &compressed)?;
+        let key        = format!("data:{}:{}", ino, block_idx);
         self.journal.log_write(ino, block_idx, &self.db.get(key.as_bytes())?.map(|v| v.to_vec()))?;
         self.db.insert(key.as_bytes(), encrypted)?;
         self.dedup.insert_hash(ino, block_idx, data)?;
         self.extents.record(ino, block_idx, &key)?;
         self.cache.put_block(ino, block_idx, data.to_vec());
-        #[cfg(feature = "cybersec")]
         self.integrity.update_block(ino, block_idx, data)?;
         Ok(())
     }
 
     pub(crate) fn remove_block(&mut self, ino: u64, block_idx: usize) -> Result<(), HfsError> {
         let key = format!("data:{}:{}", ino, block_idx);
-        self.db.remove(key.as_bytes())?;
+        self.secure_del.wipe_block(&self.db, &key)?;
         self.cache.remove_block(ino, block_idx);
         self.dedup.remove_reference(ino, block_idx)?;
         self.extents.remove(ino, block_idx)?;
-        #[cfg(feature = "cybersec")]
         self.integrity.remove_block(ino, block_idx)?;
         Ok(())
     }
 
+    // ── Data I/O ──────────────────────────────────────────────────────────────
+
     pub(crate) fn read_data(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, HfsError> {
-        let mut result = Vec::with_capacity(size as usize);
+        let mut result   = Vec::with_capacity(size as usize);
         let start_block  = (offset as usize) / FS_BLOCK_SIZE as usize;
         let end_block    = ((offset as usize + size as usize - 1) / FS_BLOCK_SIZE as usize) + 1;
         let inner_offset = (offset as usize) % FS_BLOCK_SIZE as usize;
@@ -354,13 +283,12 @@ impl GhostFS {
         let mut pos = 0;
         for block_idx in start_block..end_block {
             let mut block = self.get_block(ino, block_idx)?;
-            let block_start = if block_idx == start_block { inner_offset } else { 0 };
+            let bstart = if block_idx == start_block { inner_offset } else { 0 };
             if block.len() < FS_BLOCK_SIZE as usize { block.resize(FS_BLOCK_SIZE as usize, 0); }
-            let bytes_to_write = (FS_BLOCK_SIZE as usize - block_start).min(data.len() - pos);
-            block[block_start..block_start + bytes_to_write]
-            .copy_from_slice(&data[pos..pos + bytes_to_write]);
+            let to_write = (FS_BLOCK_SIZE as usize - bstart).min(data.len() - pos);
+            block[bstart..bstart + to_write].copy_from_slice(&data[pos..pos + to_write]);
             self.put_block(ino, block_idx, &block)?;
-            pos += bytes_to_write;
+            pos += to_write;
         }
         Ok(data.len() as u32)
     }
@@ -391,13 +319,12 @@ impl GhostFS {
             }
         }
         let prefix = format!("dir:{}:", ino);
-        let iter   = self.db.scan_prefix(prefix.as_bytes());
         let mut entries = Vec::new();
-        for item in iter {
+        for item in self.db.scan_prefix(prefix.as_bytes()) {
             let (k, v) = item?;
             let k_str  = String::from_utf8(k.to_vec())?;
             if !k_str.starts_with(&prefix) { break; }
-            let name       = OsString::from(k_str[prefix.len()..].to_string());
+            let name      = OsString::from(k_str[prefix.len()..].to_string());
             let child_ino: u64 = bincode::deserialize(&v)?;
             if let Some(inode) = self.get_inode(child_ino)? {
                 entries.push((child_ino, inode.attr.kind.into(), name));
@@ -406,24 +333,17 @@ impl GhostFS {
         Ok(entries)
     }
 
+    /// Constant-time MAC (Bell-LaPadula) + DAC (Unix mode) permission check.
     pub(crate) fn check_permission(&mut self, ino: u64, uid: u32, gid: u32, access_mask: i32) -> Result<bool, HfsError> {
-        let inode = self.get_inode(ino)?.ok_or(HfsError::NoEntry)?;
-
-        #[cfg(feature = "cybersec")]
-        {
-            if !self.mac.check(ino, uid, gid, access_mask)? { return Ok(false); }
-            self.ids.record_access(uid, ino, access_mask)?;
-        }
-
-        let mode = inode.attr.perm;
-        if uid == 0 { return Ok(true); }
-        if uid == inode.attr.uid {
-            Ok((mode as i32 & access_mask) == access_mask)
-        } else if gid == inode.attr.gid {
-            Ok(((mode >> 3) as i32 & access_mask) == access_mask)
-        } else {
-            Ok(((mode >> 6) as i32 & access_mask) == access_mask)
-        }
+        let inode  = self.get_inode(ino)?.ok_or(HfsError::NoEntry)?;
+        let mac_ok = self.mac.check_ct(ino, uid, gid, access_mask)?;
+        self.ids.record_access(uid, ino, access_mask)?;
+        let mode   = inode.attr.perm;
+        let dac_ok = if uid == 0                  { true }
+        else if uid == inode.attr.uid          { (mode as i32 & access_mask) == access_mask }
+        else if gid == inode.attr.gid          { ((mode >> 3) as i32 & access_mask) == access_mask }
+        else                                   { ((mode >> 6) as i32 & access_mask) == access_mask };
+        Ok(mac_ok & dac_ok)
     }
 
     pub(crate) fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
@@ -434,10 +354,9 @@ impl GhostFS {
         self.quota.update_usage(uid, delta)
     }
 
-    pub(crate) fn log_audit(&self, uid: u32, operation: &str, ino: u64, name: Option<&OsStr>) -> Result<(), HfsError> {
-        self.audit.log(uid, operation, ino, name)?;
-        #[cfg(feature = "cybersec")]
-        self.forensics.record(uid, operation, ino, name)?;
+    pub(crate) fn log_audit(&self, uid: u32, op: &str, ino: u64, name: Option<&OsStr>) -> Result<(), HfsError> {
+        self.audit.log(uid, op, ino, name)?;
+        self.forensics.record(uid, op, ino, name)?;
         Ok(())
     }
 
@@ -455,30 +374,26 @@ impl GhostFS {
     }
 }
 
-pub fn format(db_path: &Path, _encryption: bool, block_size: Option<u32>) -> Result<(), HfsError> {
+/// Inicjalizacja nowego wolumenu z uwierzytelnionym superblock.
+pub fn format(db_path: &Path, master_key: &Key, block_size: Option<u32>) -> Result<(), HfsError> {
     let db = sled::open(db_path)?;
     let mut batch = sled::Batch::default();
+    let bs = block_size.unwrap_or(FS_BLOCK_SIZE);
     batch.insert(b"next_ino", bincode::serialize(&(ROOT_INO + 1))?);
     let root_attr = fuser::FileAttr {
         ino: ROOT_INO, size: 0, blocks: 0,
-        atime: std::time::UNIX_EPOCH,
-        mtime: std::time::UNIX_EPOCH,
-        ctime: std::time::UNIX_EPOCH,
-        crtime: std::time::UNIX_EPOCH,
+        atime: std::time::UNIX_EPOCH, mtime: std::time::UNIX_EPOCH,
+        ctime: std::time::UNIX_EPOCH, crtime: std::time::UNIX_EPOCH,
         kind: fuser::FileType::Directory,
         perm: 0o755, nlink: 2, uid: 0, gid: 0,
-        rdev: 0, blksize: block_size.unwrap_or(FS_BLOCK_SIZE), flags: 0,
+        rdev: 0, blksize: bs, flags: 0,
     };
     batch.insert(
         format!("inode:{}", ROOT_INO).as_bytes(),
-            bincode::serialize(&Inode { attr: root_attr.into(), parent: 0 })?,
+            bincode::serialize(&serialization::Inode { attr: root_attr.into(), parent: 0 })?,
     );
-    batch.insert(b"sb:block_size", bincode::serialize(&block_size.unwrap_or(FS_BLOCK_SIZE))?);
-    batch.insert(b"sb:version", b"ghostfs-2.0");
-    batch.insert(b"sb:created", bincode::serialize(
-        &std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
-    )?);
+    let sb = Superblock::new(bs, master_key)?;
+    batch.insert(b"sb:data", bincode::serialize(&sb)?);
     db.apply_batch(batch)?;
     db.flush()?;
     Ok(())
