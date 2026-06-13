@@ -1,8 +1,12 @@
 [package]
 name = "ghostfs"
-version = "0.0.1"
+version = "0.3.0"
 edition = "2021"
-description = "GhostFS — production-grade filesystem for HackerOS"
+description = "GhostFS — production-grade cybersecurity filesystem for HackerOS"
+
+[lib]
+name = "ghostfs"
+path = "source-code/lib.rs"
 
 [[bin]]
 name = "ghostfs"
@@ -30,12 +34,17 @@ thiserror    = "1.0"
 anyhow       = "1.0"
 zstd         = { version = "0.13", optional = true }
 lz4          = { version = "1.24", optional = true }
+# P0: KDF - Argon2id key derivation
+argon2       = "0.5"
+# P0: Secure memory zeroing
+zeroize      = { version = "1.7", features = ["derive"] }
+# Constant-time comparison (timing attack mitigation)
+subtle       = "2.5"
 
 [features]
-default  = ["zstd", "lz4", "normal"]
+default  = ["zstd", "lz4", "cybersec"]
 zstd     = ["dep:zstd"]
 lz4      = ["dep:lz4"]
-normal   = []
 cybersec = []
 
 [profile.release]
