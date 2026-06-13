@@ -1,3 +1,4 @@
+
 use std::io;
 use thiserror::Error;
 
@@ -21,11 +22,20 @@ pub enum HfsError {
     #[error("Encryption/decryption error")]
     CryptoError,
 
+    #[error("KDF error: {0}")]
+    KdfError(String),
+
+    #[error("Superblock HMAC verification failed — volume may be tampered")]
+    SuperblockTampered,
+
     #[error("Entry not found")]
     NoEntry,
 
     #[error("Quota exceeded for uid {0}")]
     QuotaExceeded(u32),
+
+    #[error("I/O rate limit exceeded for uid {0}")]
+    RateLimited(u32),
 
     #[error("Corrupted data detected")]
     CorruptedData,
@@ -55,13 +65,15 @@ pub enum HfsError {
 impl From<HfsError> for libc::c_int {
     fn from(e: HfsError) -> Self {
         match e {
-            HfsError::NoEntry           => libc::ENOENT,
-            HfsError::QuotaExceeded(_) => libc::EDQUOT,
-            HfsError::CorruptedData     => libc::EIO,
-            HfsError::InvalidArgument(_)=> libc::EINVAL,
-            HfsError::MacDenied         => libc::EACCES,
-            HfsError::PermissionDenied  => libc::EACCES,
-            _                           => libc::EIO,
+            HfsError::NoEntry            => libc::ENOENT,
+            HfsError::QuotaExceeded(_)   => libc::EDQUOT,
+            HfsError::RateLimited(_)     => libc::EBUSY,
+            HfsError::CorruptedData      => libc::EIO,
+            HfsError::InvalidArgument(_) => libc::EINVAL,
+            HfsError::MacDenied          => libc::EACCES,
+            HfsError::PermissionDenied   => libc::EACCES,
+            HfsError::SuperblockTampered => libc::EIO,
+            _                            => libc::EIO,
         }
     }
 }
