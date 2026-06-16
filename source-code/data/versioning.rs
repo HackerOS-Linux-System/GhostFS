@@ -3,16 +3,12 @@ use serde::{Serialize, Deserialize};
 use crate::error::HfsError;
 use crate::FS_BLOCK_SIZE;
 
-/// Maximum number of versions kept per inode.
 const MAX_VERSIONS: usize = 8;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Version {
     pub timestamp: u64,
-    /// Serialised Inode (metadata snapshot)
     pub inode: Vec<u8>,
-    /// Optional block snapshots captured during repair or explicit checkpoint.
-    /// Key = block_idx, Value = raw (encrypted + compressed) bytes as stored in sled.
     pub blocks: std::collections::BTreeMap<usize, Vec<u8>>,
 }
 
@@ -34,13 +30,11 @@ impl Versioning {
         format!("versions:{}:{}", ino, ts)
     }
 
-    /// Snapshot the current inode metadata.
-    /// Blocks are NOT copied here (cheap path called on every write).
     pub fn create_version(&self, ino: u64) -> Result<(), HfsError> {
         let inode_key  = format!("inode:{}", ino);
         let inode_data = match self.db.get(inode_key.as_bytes())? {
             Some(d) => d.to_vec(),
-            None    => return Ok(()), // inode doesn't exist yet — nothing to snapshot
+            None    => return Ok(()),
         };
 
         let timestamp = current_timestamp()?;
@@ -56,12 +50,10 @@ impl Versioning {
                      bincode::serialize(&version)?,
         );
 
-        // Maintain the sorted timestamp list
         let mut list = self.load_list(ino)?;
         list.push(timestamp);
         list.sort_unstable();
 
-        // Evict oldest snapshots if over cap
         while list.len() > MAX_VERSIONS {
             let old_ts = list.remove(0);
             batch.remove(Self::version_key(ino, old_ts).as_bytes());
@@ -75,8 +67,6 @@ impl Versioning {
         Ok(())
     }
 
-    /// Create a full checkpoint: snapshot inode + all block data.
-    /// More expensive — called explicitly (e.g. before a truncate or bulk write).
     pub fn create_full_checkpoint(&self, ino: u64) -> Result<(), HfsError> {
         let inode_key  = format!("inode:{}", ino);
         let inode_data = match self.db.get(inode_key.as_bytes())? {
@@ -124,19 +114,16 @@ impl Versioning {
         self.load_list(ino)
     }
 
-    /// Restore inode metadata (and blocks if the snapshot has them).
     pub fn restore_version(&self, ino: u64, timestamp: u64) -> Result<(), HfsError> {
         let vkey = Self::version_key(ino, timestamp);
         let raw  = self.db.get(vkey.as_bytes())?.ok_or(HfsError::NoEntry)?;
         let version: Version = bincode::deserialize(&raw)?;
 
         let mut batch = sled::Batch::default();
-        // Restore inode metadata
         batch.insert(
             format!("inode:{}", ino).as_bytes(),
                 version.inode.clone(),
         );
-        // Restore block data if available in the snapshot
         for (block_idx, data) in &version.blocks {
             batch.insert(
                 format!("data:{}:{}", ino, block_idx).as_bytes(),
@@ -147,7 +134,6 @@ impl Versioning {
         Ok(())
     }
 
-    /// Remove all version records for a deleted inode.
     pub fn remove_all_versions(&self, ino: u64) -> Result<(), HfsError> {
         let list = self.load_list(ino)?;
         let mut batch = sled::Batch::default();
