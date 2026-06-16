@@ -75,7 +75,7 @@ impl MacLabels {
         let key = format!("mac:label:{}", ino);
         Ok(match self.db.get(key.as_bytes())? {
             Some(v) => bincode::deserialize(&v)?,
-           None    => MacLabel::default(),
+            None    => MacLabel::default(),
         })
     }
 
@@ -90,7 +90,7 @@ impl MacLabels {
         let key = format!("mac:clearance:{}", uid);
         Ok(match self.db.get(key.as_bytes())? {
             Some(v) => bincode::deserialize(&v)?,
-           None    => MacClearance { level: SensitivityLevel::Unclassified, compartments: 0, trusted: false },
+            None    => MacClearance { level: SensitivityLevel::Unclassified, compartments: 0, trusted: false },
         })
     }
 
@@ -115,9 +115,9 @@ impl MacLabels {
 
     pub fn handle_setxattr_label(&self, ino: u64, value: &[u8]) -> Result<(), HfsError> {
         let label = Self::parse_xattr_label(value)
-        .ok_or_else(|| HfsError::InvalidArgument(
-            "Invalid MAC label. Expected 'Level:0xCompartments'".into()
-        ))?;
+            .ok_or_else(|| HfsError::InvalidArgument(
+                "Invalid MAC label. Expected 'Level:0xCompartments'".into()
+            ))?;
         self.set_label(ino, &label)?;
         log::info!("MAC label set via xattr: ino={} {:?}:{:#x}", ino, label.level, label.compartments);
         Ok(())
@@ -125,7 +125,6 @@ impl MacLabels {
 
     /// Constant-time Bell-LaPadula access check.
     /// All branches computed before returning — no early exit on deny.
-    /// Prevents timing-based inference of sensitivity labels.
     pub fn check_ct(&self, ino: u64, uid: u32, _gid: u32, access_mask: i32) -> Result<bool, HfsError> {
         let label     = self.get_label(ino)?;
         let clearance = self.get_clearance(uid)?;
@@ -133,13 +132,13 @@ impl MacLabels {
         let trusted_pass: u8 = clearance.trusted as u8;
 
         let comps_ok: u8 = (label.compartments == 0
-        || (clearance.compartments & label.compartments) == label.compartments) as u8;
+            || (clearance.compartments & label.compartments) == label.compartments) as u8;
 
         let read_ok: u8 = (access_mask & libc::R_OK == 0
-        || clearance.level >= label.level) as u8;
+            || clearance.level >= label.level) as u8;
 
         let write_ok: u8 = (access_mask & libc::W_OK == 0
-        || clearance.level <= label.level) as u8;
+            || clearance.level <= label.level) as u8;
 
         let allowed = (trusted_pass | (comps_ok & read_ok & write_ok)) != 0;
 
