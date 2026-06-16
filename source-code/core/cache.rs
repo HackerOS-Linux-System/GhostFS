@@ -29,8 +29,6 @@ impl Cache {
         }
     }
 
-    // ---------- Inode cache ----------
-
     pub fn get_inode(&mut self, ino: u64) -> Option<Inode> {
         if let Some(entry) = self.inodes.get(&ino) {
             self.inode_lru.put(ino, ());
@@ -60,8 +58,6 @@ impl Cache {
         }
     }
 
-    // ---------- Block cache ----------
-
     pub fn get_block(&mut self, ino: u64, idx: usize) -> Option<Vec<u8>> {
         let key = (ino, idx);
         if let Some(entry) = self.blocks.get(&key) {
@@ -78,14 +74,11 @@ impl Cache {
         self.evict_blocks();
     }
 
-    /// Mark a block as dirty (pending write-back).
     pub fn mark_dirty(&mut self, ino: u64, idx: usize, data: Vec<u8>) {
         let key = (ino, idx);
         self.dirty_blocks.insert(key, Arc::new(data));
     }
 
-    /// Drain all dirty blocks for a write-back flush.
-    /// Returns vec of (ino, block_idx, data).
     pub fn flush_dirty(&mut self) -> Vec<(u64, usize, Vec<u8>)> {
         let keys: Vec<_> = self.dirty_blocks.iter().map(|r| *r.key()).collect();
         let mut out = Vec::new();
@@ -104,7 +97,6 @@ impl Cache {
         self.block_lru.pop(&key);
     }
 
-    /// Return read-ahead hint: the next N block indices to prefetch.
     pub fn read_ahead_hint(last_block: usize) -> Vec<usize> {
         (last_block + 1..=last_block + READ_AHEAD_BLOCKS).collect()
     }
