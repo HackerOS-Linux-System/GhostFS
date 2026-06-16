@@ -4,18 +4,37 @@ use fuser::{
     Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyOpen, ReplyWrite, ReplyXattr, ReplyCreate, ReplyStatfs,
 };
-use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EISDIR, ERANGE, ENODATA, EACCES};
+use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EISDIR, ERANGE, ENODATA, EACCES, ELOOP};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::time::SystemTime;
 use std::sync::atomic::Ordering;
 
 impl Filesystem for GhostFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        // O_NOFOLLOW enforcement: sprawdź czy name nie jest symlinkiem
+        // Jeśli lookup wynika z symlink traversal poza wolumen — odrzuć
         match self.lookup_name(parent, name) {
             Ok(Some(ino)) => {
                 if let Ok(Some(inode)) = self.get_inode(ino) {
-                    reply.entry(&TTL, &inode.attr.into(), 0); return;
+                    // Blokuj symlinki wskazujące poza GhostFS (path traversal ochrona)
+                    if inode.attr.kind == fuser::FileType::Symlink.into() {
+                        if let Ok(Some(target)) = self.db.get(format!("data:{}:0", ino).as_bytes()) {
+                            let target_str = String::from_utf8_lossy(&target);
+                            // Absolutne ścieżki lub "../" mogą wychodzić poza FS
+                            if target_str.starts_with('/') || target_str.contains("../") {
+                                log::warn!("O_NOFOLLOW: blocking symlink ino={} target='{}' uid={}",
+                                    ino, target_str, req.uid());
+                                self.ids.emit_alert(req.uid(),
+                                    ids::AlertKind::SymlinkTraversal { ino },
+                                    &format!("symlink to '{}' blocked", target_str)).ok();
+                                reply.error(ELOOP);
+                                return;
+                            }
+                        }
+                    }
+                    reply.entry(&TTL, &inode.attr.into(), 0);
+                    return;
                 }
             }
             _ => {}
@@ -26,7 +45,7 @@ impl Filesystem for GhostFS {
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.get_inode(ino) {
             Ok(Some(inode)) => reply.attr(&TTL, &inode.attr.into()),
-            _ => reply.error(ENOENT),
+            _               => reply.error(ENOENT),
         }
     }
 
@@ -37,9 +56,7 @@ impl Filesystem for GhostFS {
         _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr,
     ) {
-        let mut inode = match self.get_inode(ino) {
-            Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; }
-        };
+        let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if req.uid() != 0 && req.uid() != inode.attr.uid { reply.error(EACCES); return; }
         let mut attr: fuser::FileAttr = inode.attr.into();
         if let Some(m) = mode { attr.perm = m as u16; }
@@ -65,112 +82,97 @@ impl Filesystem for GhostFS {
     fn mknod(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, rdev: u32, reply: ReplyEntry) {
         if let Err(e) = self.check_quota(req.uid(), 0) { reply.error(e.into()); return; }
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        let now = SystemTime::now();
+        let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
+        let now  = SystemTime::now();
         let perm = (mode & !umask) as u16;
         let kind = if mode & libc::S_IFIFO as u32 != 0 { fuser::FileType::NamedPipe }
-        else if mode & libc::S_IFCHR as u32 != 0 { fuser::FileType::CharDevice }
-        else if mode & libc::S_IFBLK as u32 != 0 { fuser::FileType::BlockDevice }
-        else { fuser::FileType::RegularFile };
-        let attr = fuser::FileAttr { ino, size: 0, blocks: 0, atime: now, mtime: now, ctime: now, crtime: now,
+            else if mode & libc::S_IFCHR as u32 != 0   { fuser::FileType::CharDevice }
+            else if mode & libc::S_IFBLK as u32 != 0   { fuser::FileType::BlockDevice }
+            else                                         { fuser::FileType::RegularFile };
+        let attr  = fuser::FileAttr { ino, size: 0, blocks: 0, atime: now, mtime: now, ctime: now, crtime: now,
             kind, perm, nlink: 1, uid: req.uid(), gid: req.gid(), rdev, blksize: FS_BLOCK_SIZE, flags: 0 };
-            let inode = serialization::Inode { attr: attr.into(), parent };
-            let parent_inode = self.get_inode(parent).ok().flatten();
-            if let Err(e) = self.with_batch(|batch| {
-                batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-                batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = now;
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
-                Ok(())
-            }) { reply.error(e.into()); return; }
-            self.dirindex.insert(parent, name, ino).ok();
-            self.log_audit(req.uid(), "mknod", ino, Some(name)).ok();
-            reply.entry(&TTL, &attr, 0);
+        let inode = serialization::Inode { attr: attr.into(), parent };
+        let pi    = self.get_inode(parent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
+            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+            Ok(())
+        }) { reply.error(e.into()); return; }
+        self.dirindex.insert(parent, name, ino).ok();
+        self.log_audit(req.uid(), "mknod", ino, Some(name)).ok();
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn mkdir(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        let now = SystemTime::now();
+        let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
+        let now  = SystemTime::now();
         let perm = (mode & !umask) as u16;
         let attr = fuser::FileAttr { ino, size: 0, blocks: 0, atime: now, mtime: now, ctime: now, crtime: now,
-            kind: fuser::FileType::Directory, perm, nlink: 2, uid: req.uid(), gid: req.gid(), rdev: 0, blksize: FS_BLOCK_SIZE, flags: 0 };
-            let inode = serialization::Inode { attr: attr.into(), parent };
-            let parent_inode = self.get_inode(parent).ok().flatten();
-            if let Err(e) = self.with_batch(|batch| {
-                batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-                batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = now; pa.nlink += 1;
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
-                Ok(())
-            }) { reply.error(e.into()); return; }
-            self.dirindex.insert(parent, name, ino).ok();
-            self.log_audit(req.uid(), "mkdir", ino, Some(name)).ok();
-            reply.entry(&TTL, &attr, 0);
+            kind: fuser::FileType::Directory, perm, nlink: 2, uid: req.uid(), gid: req.gid(),
+            rdev: 0, blksize: FS_BLOCK_SIZE, flags: 0 };
+        let inode = serialization::Inode { attr: attr.into(), parent };
+        let pi = self.get_inode(parent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
+            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now; pa.nlink += 1;
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+            Ok(())
+        }) { reply.error(e.into()); return; }
+        self.dirindex.insert(parent, name, ino).ok();
+        self.log_audit(req.uid(), "mkdir", ino, Some(name)).ok();
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let ino = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
-        let kind: fuser::FileType = inode.attr.kind.into();
-        if kind == fuser::FileType::Directory { reply.error(EISDIR); return; }
-        if let Err(e) = self.check_permission(parent, req.uid(), req.gid(), libc::W_OK) {
-            reply.error(e.into()); return;
-        }
+        if fuser::FileType::from(inode.attr.kind) == fuser::FileType::Directory { reply.error(EISDIR); return; }
+        if let Err(e) = self.check_permission(parent, req.uid(), req.gid(), libc::W_OK) { reply.error(e.into()); return; }
         self.ids.record_delete(req.uid(), ino).ok();
-
-        // Determine if file has a classified MAC label — if so, use secure deletion
+        // Secure wipe dla plików Confidential+
         let mac_label = self.mac.get_label(ino).unwrap_or_default();
-        let is_classified = mac_label.level as u8 >= 2; // Confidential or above
-
+        let is_classified = mac_label.level as u8 >= 2;
         let mut inode = inode;
         inode.attr.nlink -= 1;
-        let parent_inode = self.get_inode(parent).ok().flatten();
-
+        let pi = self.get_inode(parent).ok().flatten();
         if inode.attr.nlink == 0 {
             if is_classified {
-                // Secure wipe before removing sled keys
                 self.secure_del.wipe_inode_blocks(&self.db, ino).ok();
                 self.secure_del.wipe_metadata(&self.db, ino).ok();
             }
-
-            let data_prefix  = format!("data:{}:", ino);
-            let hash_prefix  = format!("hash:{}:", ino);
-            let ref_prefix   = format!("ref:{}:", ino);
-            let xattr_prefix = format!("xattr:{}:", ino);
-            if let Err(e) = self.with_batch(|batch| {
-                batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-                batch.remove(format!("inode:{}", ino).as_bytes());
-                for item in self.db.scan_prefix(data_prefix.as_bytes()) { let (k,_) = item?; batch.remove(k); }
-                for item in self.db.scan_prefix(hash_prefix.as_bytes()) { let (k,_) = item?; batch.remove(k); }
-                for item in self.db.scan_prefix(ref_prefix.as_bytes())  { let (k,_) = item?; batch.remove(k); }
-                for item in self.db.scan_prefix(xattr_prefix.as_bytes()){ let (k,_) = item?; batch.remove(k); }
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = SystemTime::now();
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
+            let dp  = format!("data:{}:", ino);
+            let hp  = format!("hash:{}:", ino);
+            let rp  = format!("ref:{}:",  ino);
+            let xp  = format!("xattr:{}:", ino);
+            if let Err(e) = self.with_batch(|b| {
+                b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
+                b.remove(format!("inode:{}", ino).as_bytes());
+                for item in self.db.scan_prefix(dp.as_bytes()) { let (k,_) = item?; b.remove(k); }
+                for item in self.db.scan_prefix(hp.as_bytes()) { let (k,_) = item?; b.remove(k); }
+                for item in self.db.scan_prefix(rp.as_bytes()) { let (k,_) = item?; b.remove(k); }
+                for item in self.db.scan_prefix(xp.as_bytes()) { let (k,_) = item?; b.remove(k); }
+                if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
+                    b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
                 Ok(())
             }) { reply.error(e.into()); return; }
             self.extents.remove_all(ino).ok();
-            let prefix = format!("itree:{}:", ino);
-            let keys: Vec<_> = self.db.scan_prefix(prefix.as_bytes()).filter_map(|r| r.ok()).map(|(k,_)| k).collect();
+            let keys: Vec<_> = self.db.scan_prefix(format!("itree:{}:", ino).as_bytes())
+                .filter_map(|r| r.ok()).map(|(k,_)| k).collect();
             let mut batch = sled::Batch::default();
             for k in keys { batch.remove(k); }
             self.db.apply_batch(batch).ok();
         } else {
-            if let Err(e) = self.with_batch(|batch| {
-                batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = SystemTime::now();
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
+            if let Err(e) = self.with_batch(|b| {
+                b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
+                b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+                if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
+                    b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
                 Ok(())
             }) { reply.error(e.into()); return; }
         }
@@ -184,14 +186,12 @@ impl Filesystem for GhostFS {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if inode.attr.kind != fuser::FileType::Directory.into() { reply.error(ENOTDIR); return; }
         if !self.is_dir_empty(ino).unwrap_or(false) { reply.error(ENOTEMPTY); return; }
-        let parent_inode = self.get_inode(parent).ok().flatten();
-        if let Err(e) = self.with_batch(|batch| {
-            batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-            batch.remove(format!("inode:{}", ino).as_bytes());
-            if let Some(pi) = parent_inode {
-                let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = SystemTime::now(); pa.nlink -= 1;
-                batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-            }
+        let pi = self.get_inode(parent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
+            b.remove(format!("inode:{}", ino).as_bytes());
+            if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now(); pa.nlink -= 1;
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
         self.dirindex.remove(parent, name).ok();
@@ -201,29 +201,27 @@ impl Filesystem for GhostFS {
 
     fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &std::path::Path, reply: ReplyEntry) {
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        let now = SystemTime::now();
+        let ino    = self.next_ino.fetch_add(1, Ordering::SeqCst);
+        let now    = SystemTime::now();
         let target = link.to_str().unwrap_or("").as_bytes().to_vec();
-        let size = target.len() as u64;
-        let attr = fuser::FileAttr { ino, size, blocks: (size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64,
+        let size   = target.len() as u64;
+        let attr   = fuser::FileAttr { ino, size, blocks: (size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64,
             atime: now, mtime: now, ctime: now, crtime: now, kind: fuser::FileType::Symlink,
             perm: 0o777, nlink: 1, uid: req.uid(), gid: req.gid(), rdev: 0, blksize: FS_BLOCK_SIZE, flags: 0 };
-            let inode = serialization::Inode { attr: attr.into(), parent };
-            let parent_inode = self.get_inode(parent).ok().flatten();
-            if let Err(e) = self.with_batch(|batch| {
-                batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-                batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
-                batch.insert(format!("data:{}:0", ino).as_bytes(), target);
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = now;
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
-                Ok(())
-            }) { reply.error(e.into()); return; }
-            self.dirindex.insert(parent, name, ino).ok();
-            self.log_audit(req.uid(), "symlink", ino, Some(name)).ok();
-            reply.entry(&TTL, &attr, 0);
+        let inode = serialization::Inode { attr: attr.into(), parent };
+        let pi    = self.get_inode(parent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
+            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("data:{}:0", ino).as_bytes(), target);
+            if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+            Ok(())
+        }) { reply.error(e.into()); return; }
+        self.dirindex.insert(parent, name, ino).ok();
+        self.log_audit(req.uid(), "symlink", ino, Some(name)).ok();
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
@@ -243,14 +241,12 @@ impl Filesystem for GhostFS {
         let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if fuser::FileType::from(inode.attr.kind) == fuser::FileType::Directory { reply.error(EISDIR); return; }
         inode.attr.nlink += 1;
-        let newparent_inode = self.get_inode(newparent).ok().flatten();
-        if let Err(e) = self.with_batch(|batch| {
-            batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            batch.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
-            if let Some(npi) = newparent_inode {
-                let mut pa: fuser::FileAttr = npi.attr.into(); pa.mtime = SystemTime::now();
-                batch.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: npi.parent })?);
-            }
+        let npi = self.get_inode(newparent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+            b.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            if let Some(p) = npi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
+                b.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
         self.dirindex.insert(newparent, newname, ino).ok();
@@ -261,35 +257,31 @@ impl Filesystem for GhostFS {
     fn rename(&mut self, req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let ino = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
-        if let Ok(Some(target_ino)) = self.lookup_name(newparent, newname) {
-            if let Ok(Some(target)) = self.get_inode(target_ino) {
-                if fuser::FileType::from(target.attr.kind) == fuser::FileType::Directory
-                    && !self.is_dir_empty(target_ino).unwrap_or(false)
-                    { reply.error(ENOTEMPTY); return; }
+        if let Ok(Some(tino)) = self.lookup_name(newparent, newname) {
+            if let Ok(Some(t)) = self.get_inode(tino) {
+                if fuser::FileType::from(t.attr.kind) == fuser::FileType::Directory
+                    && !self.is_dir_empty(tino).unwrap_or(false)
+                { reply.error(ENOTEMPTY); return; }
             }
         }
-        let now = SystemTime::now();
-        let kind: fuser::FileType = inode.attr.kind.into();
-        let old_parent = self.get_inode(parent).ok().flatten();
-        let new_parent = self.get_inode(newparent).ok().flatten();
-        if let Err(e) = self.with_batch(|batch| {
-            batch.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-            batch.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+        let now  = SystemTime::now();
+        let kind = fuser::FileType::from(inode.attr.kind);
+        let op   = self.get_inode(parent).ok().flatten();
+        let np   = self.get_inode(newparent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
+            b.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
             if parent != newparent && kind == fuser::FileType::Directory {
                 inode.parent = newparent;
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+                b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
             }
-            if let Some(op) = old_parent {
-                let mut pa: fuser::FileAttr = op.attr.into(); pa.mtime = now;
+            if let Some(p) = op { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
                 if kind == fuser::FileType::Directory { pa.nlink -= 1; }
-                batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: op.parent })?);
-            }
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             if parent != newparent {
-                if let Some(np) = new_parent {
-                    let mut pa: fuser::FileAttr = np.attr.into(); pa.mtime = now;
+                if let Some(p) = np { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
                     if kind == fuser::FileType::Directory { pa.nlink += 1; }
-                    batch.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: np.parent })?);
-                }
+                    b.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             }
             Ok(())
         }) { reply.error(e.into()); return; }
@@ -299,11 +291,16 @@ impl Filesystem for GhostFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        // Canary check — trigger alert jeśli plik jest honeypot
+        self.canary.check_and_trigger(ino, req.uid()).ok();
         reply.opened(0, 0);
     }
 
-    fn read(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        // Fsfreeze check
+        if self.frozen.load(std::sync::atomic::Ordering::SeqCst) { reply.error(EIO); return; }
+
         match self.check_permission(ino, req.uid(), req.gid(), libc::R_OK) {
             Ok(true)  => {}
             Ok(false) => { self.ids.record_perm_fail(req.uid(), ino).ok(); reply.error(EACCES); return; }
@@ -316,32 +313,27 @@ impl Filesystem for GhostFS {
                 let _ = self.put_inode(ino, &inode);
             }
         }
-        // Anti-exfiltration + lateral movement tracking
-        let owner_uid = self.get_inode(ino).ok().flatten().map(|i| i.attr.uid).unwrap_or(0);
-        self.ids.record_read(req.uid(), ino, size as u64, owner_uid).ok();
-
+        let owner = self.get_inode(ino).ok().flatten().map(|i| i.attr.uid).unwrap_or(0);
+        self.ids.record_read(req.uid(), ino, size as u64, owner).ok();
         match self.read_data(ino, offset, size) {
             Ok(data) => reply.data(&data),
             Err(e)   => reply.error(e.into()),
         }
     }
 
-    fn write(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
+    fn write(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _wf: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+        // Fsfreeze check
+        if self.frozen.load(std::sync::atomic::Ordering::SeqCst) { reply.error(EIO); return; }
+
         match self.check_permission(ino, req.uid(), req.gid(), libc::W_OK) {
             Ok(true)  => {}
             Ok(false) => { self.ids.record_perm_fail(req.uid(), ino).ok(); reply.error(EACCES); return; }
             Err(_)    => { reply.error(ENOENT); return; }
         }
-
-        // Rate limiting (P3 — prevents CPU/IO monopoly)
-        if let Err(e) = self.rate_limit.check_io(req.uid(), data.len() as u64) {
-            reply.error(e.into()); return;
-        }
-
+        if let Err(e) = self.rate_limit.check_io(req.uid(), data.len() as u64) { reply.error(e.into()); return; }
         let uid = req.uid();
         if let Err(e) = self.check_quota(uid, data.len() as u64) { reply.error(e.into()); return; }
         if let Err(e) = self.create_version(ino) { reply.error(e.into()); return; }
-
         match self.write_data(ino, offset, data) {
             Ok(written) => {
                 if let Ok(Some(mut inode)) = self.get_inode(ino) {
@@ -359,10 +351,9 @@ impl Filesystem for GhostFS {
         }
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        if self.journal.commit_barrier().is_err() || self.db.flush().is_err() {
-            reply.error(EIO);
-        } else { reply.ok(); }
+    fn flush(&mut self, _req: &Request, _ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
+        if self.journal.commit_barrier().is_err() || self.db.flush().is_err() { reply.error(EIO); }
+        else { reply.ok(); }
     }
 
     fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
@@ -372,34 +363,31 @@ impl Filesystem for GhostFS {
                 reply.error(EIO); return;
             }
         }
-        if self.journal.commit_barrier().is_err() || self.db.flush().is_err() {
-            reply.error(EIO);
-        } else { reply.ok(); }
+        if self.journal.commit_barrier().is_err() || self.db.flush().is_err() { reply.error(EIO); }
+        else { reply.ok(); }
     }
 
     fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        let now = SystemTime::now();
+        let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
+        let now  = SystemTime::now();
         let perm = (mode & !umask) as u16;
         let attr = fuser::FileAttr { ino, size: 0, blocks: 0, atime: now, mtime: now, ctime: now, crtime: now,
             kind: fuser::FileType::RegularFile, perm, nlink: 1, uid: req.uid(), gid: req.gid(),
             rdev: 0, blksize: FS_BLOCK_SIZE, flags: 0 };
-            let inode = serialization::Inode { attr: attr.into(), parent };
-            let parent_inode = self.get_inode(parent).ok().flatten();
-            if let Err(e) = self.with_batch(|batch| {
-                batch.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-                batch.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-                batch.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
-                if let Some(pi) = parent_inode {
-                    let mut pa: fuser::FileAttr = pi.attr.into(); pa.mtime = now;
-                    batch.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: pi.parent })?);
-                }
-                Ok(())
-            }) { reply.error(e.into()); return; }
-            self.dirindex.insert(parent, name, ino).ok();
-            self.log_audit(req.uid(), "create", ino, Some(name)).ok();
-            reply.created(&TTL, &attr, 0, 0, flags as u32);
+        let inode = serialization::Inode { attr: attr.into(), parent };
+        let pi    = self.get_inode(parent).ok().flatten();
+        if let Err(e) = self.with_batch(|b| {
+            b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
+            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
+                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+            Ok(())
+        }) { reply.error(e.into()); return; }
+        self.dirindex.insert(parent, name, ino).ok();
+        self.log_audit(req.uid(), "create", ino, Some(name)).ok();
+        reply.created(&TTL, &attr, 0, 0, flags as u32);
     }
 
     fn readdir(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
@@ -410,15 +398,14 @@ impl Filesystem for GhostFS {
             (ino, fuser::FileType::Directory, OsString::from(".")),
             (parent_ino, fuser::FileType::Directory, OsString::from("..")),
         ];
-        if let Ok(mut child_entries) = self.readdir_entries(ino) { entries.append(&mut child_entries); }
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(entry.0, (i + 1) as i64, entry.1, &entry.2) { break; }
+        if let Ok(mut ch) = self.readdir_entries(ino) { entries.append(&mut ch); }
+        for (i, e) in entries.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(e.0, (i + 1) as i64, e.1, &e.2) { break; }
         }
         reply.ok();
     }
 
     fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
-        // Special: security.ghostfs.label returns the MAC label in xattr format
         if name.to_string_lossy() == mac::XATTR_LABEL {
             let label = self.mac.get_label(ino).unwrap_or_default();
             let value = mac::MacLabels::label_to_xattr(&label);
@@ -428,31 +415,25 @@ impl Filesystem for GhostFS {
             return;
         }
         match self.xattr.get(ino, name) {
-            Ok(Some(value)) => {
-                if size == 0 { reply.size(value.len() as u32); }
-                else if size >= value.len() as u32 { reply.data(&value); }
-                else { reply.error(ERANGE); }
-            }
-            Ok(None) => reply.error(ENODATA),
-            Err(e)   => reply.error(e.into()),
+            Ok(Some(v)) => { if size == 0 { reply.size(v.len() as u32); } else if size >= v.len() as u32 { reply.data(&v); } else { reply.error(ERANGE); } }
+            Ok(None)    => reply.error(ENODATA),
+            Err(e)      => reply.error(e.into()),
         }
     }
 
-    fn setxattr(&mut self, req: &Request, ino: u64, name: &OsStr, value: &[u8], _flags: i32, _position: u32, reply: ReplyEmpty) {
+    fn setxattr(&mut self, req: &Request, ino: u64, name: &OsStr, value: &[u8], _flags: i32, _pos: u32, reply: ReplyEmpty) {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if req.uid() != 0 && req.uid() != inode.attr.uid {
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("security.") {
-                self.ids.emit_alert(req.uid(), ids::AlertKind::SuspiciousXattr,
-                                    &format!("ino={} attr={}", ino, name_str)).ok();
+            let ns = name.to_string_lossy();
+            if ns.starts_with("security.") {
+                self.ids.emit_alert(req.uid(), ids::AlertKind::SuspiciousXattr, &format!("ino={} attr={}", ino, ns)).ok();
             }
             reply.error(EACCES); return;
         }
-        // Intercept security.ghostfs.label → MAC label update
         if name.to_string_lossy() == mac::XATTR_LABEL {
             match self.mac.handle_setxattr_label(ino, value) {
-                Ok(())  => { self.log_audit(req.uid(), "setxattr:mac_label", ino, Some(name)).ok(); reply.ok(); }
-                Err(e)  => { reply.error(e.into()); }
+                Ok(()) => { self.log_audit(req.uid(), "setxattr:mac_label", ino, Some(name)).ok(); reply.ok(); }
+                Err(e) => reply.error(e.into()),
             }
             return;
         }
@@ -464,13 +445,8 @@ impl Filesystem for GhostFS {
         match self.xattr.list(ino) {
             Ok(names) => {
                 let mut data = Vec::new();
-                // Always include the synthetic MAC label xattr
-                data.extend_from_slice(mac::XATTR_LABEL.as_bytes());
-                data.push(0);
-                for n in names {
-                    data.extend_from_slice(n.as_encoded_bytes());
-                    data.push(0);
-                }
+                data.extend_from_slice(mac::XATTR_LABEL.as_bytes()); data.push(0);
+                for n in names { data.extend_from_slice(n.as_encoded_bytes()); data.push(0); }
                 if size == 0 { reply.size(data.len() as u32); }
                 else if size >= data.len() as u32 { reply.data(&data); }
                 else { reply.error(ERANGE); }
@@ -486,12 +462,11 @@ impl Filesystem for GhostFS {
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        let used_bytes  = self.db.size_on_disk().unwrap_or(0);
-        let block_size  = FS_BLOCK_SIZE as u64;
-        let used_blocks = used_bytes / block_size;
-        let total_blocks: u64 = 1024 * 1024 * 1024 * 1024 / block_size;
-        let free_blocks = total_blocks.saturating_sub(used_blocks);
-        reply.statfs(total_blocks, free_blocks, free_blocks, 0, 0, FS_BLOCK_SIZE, 255, FS_BLOCK_SIZE);
+        let used    = self.db.size_on_disk().unwrap_or(0);
+        let bs      = FS_BLOCK_SIZE as u64;
+        let total   = 1024 * 1024 * 1024 * 1024 / bs;
+        let free    = total.saturating_sub(used / bs);
+        reply.statfs(total, free, free, 0, 0, FS_BLOCK_SIZE, 255, FS_BLOCK_SIZE);
     }
 
     fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
