@@ -26,10 +26,10 @@ impl Repair {
     ) -> Result<Self, HfsError> {
         Ok(Self {
             db:          db.clone(),
-           crypto:      crypto.clone(),
-           compression: compression.clone(),
-           dedup:       dedup.clone(),
-           versioning:  versioning.clone(),
+            crypto:      crypto.clone(),
+            compression: compression.clone(),
+            dedup:       dedup.clone(),
+            versioning:  versioning.clone(),
         })
     }
 
@@ -49,11 +49,15 @@ impl Repair {
                 Some(v) => v,
                 None    => continue,
             };
+            // Per-inode FEK decryption
             let decrypted = match &self.crypto {
-                Some(c) => match c.decrypt(&raw) {
-                    Ok(d)  => d,
-                    Err(_) => { corrupted = true; break; }
-                },
+                Some(c) => {
+                    let fek = c.derive_fek(ino);
+                    match c.decrypt_with_key(&fek, &raw) {
+                        Ok(d)  => d,
+                        Err(_) => { corrupted = true; break; }
+                    }
+                }
                 None => raw.to_vec(),
             };
             let decompressed = match self.compression.decompress(&decrypted) {
@@ -63,7 +67,6 @@ impl Repair {
             if self.dedup.verify(ino, block_idx, &decompressed).is_err() {
                 corrupted = true; break;
             }
-            // Merkle leaf verification
             let leaf_key = format!("itree:{}:leaf:{}", ino, block_idx);
             if let Ok(Some(stored_hash)) = self.db.get(leaf_key.as_bytes()) {
                 let computed = blake3::hash(&decompressed);
