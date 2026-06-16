@@ -2,15 +2,10 @@ use sled::Db;
 use serde::{Serialize, Deserialize};
 use crate::error::HfsError;
 
-
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Extent {
-    /// First logical block number covered by this extent
     pub logical_start: u64,
-    /// Number of blocks in the run
     pub length: u32,
-    /// Physical key prefix (e.g. "data:<ino>:<logical_start>")
     pub phys_key_prefix: String,
 }
 
@@ -47,8 +42,6 @@ impl ExtentTree {
         Ok(())
     }
 
-    /// Record that block `block_idx` of inode `ino` lives at key `phys_key`.
-    /// Merges with adjacent extents when possible (extent coalescing).
     pub fn record(
         &self,
         ino: u64,
@@ -58,13 +51,11 @@ impl ExtentTree {
         let mut index = self.load_index(ino)?;
         let logical = block_idx as u64;
 
-        // Check if this block extends an existing extent
         if let Some(&prev_start) = index.iter().rev().find(|&&s| s <= logical) {
             let ekey = Self::extent_key(ino, prev_start);
             if let Some(raw) = self.db.get(ekey.as_bytes())? {
                 let mut ext: Extent = bincode::deserialize(&raw)?;
                 if prev_start + ext.length as u64 == logical {
-                    // Coalesce: extend the run by one block
                     ext.length += 1;
                     self.db.insert(ekey.as_bytes(), bincode::serialize(&ext)?)?;
                     return Ok(());
@@ -72,7 +63,6 @@ impl ExtentTree {
             }
         }
 
-        // New extent for this block
         let ext = Extent {
             logical_start: logical,
             length: 1,
@@ -80,18 +70,15 @@ impl ExtentTree {
         };
         let ekey = Self::extent_key(ino, logical);
         self.db.insert(ekey.as_bytes(), bincode::serialize(&ext)?)?;
-        // Insert into sorted index
         let pos = index.partition_point(|&s| s < logical);
         index.insert(pos, logical);
         self.save_index(ino, &index)?;
         Ok(())
     }
 
-    /// Resolve logical block to its physical storage key (if tracked).
     pub fn resolve(&self, ino: u64, block_idx: usize) -> Option<String> {
         let logical = block_idx as u64;
         let index = self.load_index(ino).ok()?;
-        // Binary search for the extent whose start <= logical
         let pos = index.partition_point(|&s| s <= logical);
         if pos == 0 {
             return None;
@@ -101,12 +88,10 @@ impl ExtentTree {
         let raw = self.db.get(ekey.as_bytes()).ok()??;
         let ext: Extent = bincode::deserialize(&raw).ok()?;
         if logical < start + ext.length as u64 {
-            // Within this extent — compute the actual key
             let offset = logical - start;
             if offset == 0 {
                 Some(ext.phys_key_prefix.clone())
             } else {
-                // Keys beyond the prefix are the standard data:<ino>:<block> pattern
                 Some(format!("data:{}:{}", ino, block_idx))
             }
         } else {
@@ -114,7 +99,6 @@ impl ExtentTree {
         }
     }
 
-    /// Remove extent tracking for a single block.
     pub fn remove(&self, ino: u64, block_idx: usize) -> Result<(), HfsError> {
         let logical = block_idx as u64;
         let mut index = self.load_index(ino)?;
@@ -128,7 +112,6 @@ impl ExtentTree {
                     index.remove(pos);
                     self.save_index(ino, &index)?;
                 } else {
-                    // Shrink: split the extent
                     let mut ext = ext;
                     ext.logical_start += 1;
                     ext.length -= 1;
@@ -143,7 +126,6 @@ impl ExtentTree {
         Ok(())
     }
 
-    /// Remove all extent records for a deleted inode.
     pub fn remove_all(&self, ino: u64) -> Result<(), HfsError> {
         let prefix = format!("ext:{}:", ino);
         let keys: Vec<_> = self
