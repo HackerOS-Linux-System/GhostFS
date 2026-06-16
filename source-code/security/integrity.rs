@@ -18,7 +18,6 @@ impl IntegrityTree {
         format!("itree:{}:root", ino)
     }
 
-    /// Store the leaf hash for a block and recompute the root.
     pub fn update_block(
         &self,
         ino: u64,
@@ -32,7 +31,6 @@ impl IntegrityTree {
         Ok(())
     }
 
-    /// Verify a block's hash against the stored leaf hash.
     pub fn verify_block(
         &self,
         ino: u64,
@@ -54,7 +52,6 @@ impl IntegrityTree {
         Ok(())
     }
 
-    /// Remove the leaf hash when a block is deleted.
     pub fn remove_block(&self, ino: u64, block_idx: usize) -> Result<(), HfsError> {
         let leaf_key = Self::leaf_key(ino, block_idx);
         self.db.remove(leaf_key.as_bytes())?;
@@ -62,7 +59,6 @@ impl IntegrityTree {
         Ok(())
     }
 
-    /// Return the current Merkle root for a file (for external verification / export).
     pub fn root(&self, ino: u64) -> Result<Option<[u8; 32]>, HfsError> {
         match self.db.get(Self::root_key(ino).as_bytes())? {
             Some(v) if v.len() == 32 => {
@@ -74,8 +70,6 @@ impl IntegrityTree {
         }
     }
 
-    /// Recompute the Merkle root from all leaf hashes stored for `ino`.
-    /// We use a simple linear accumulation: iteratively hash pairs of nodes.
     fn recompute_root(&self, ino: u64) -> Result<(), HfsError> {
         let prefix = format!("itree:{}:leaf:", ino);
         let mut leaves: Vec<Vec<u8>> = Vec::new();
@@ -93,7 +87,6 @@ impl IntegrityTree {
     }
 }
 
-/// Compute Merkle root from a flat list of leaf hashes.
 fn merkle_root(leaves: &[Vec<u8>]) -> Vec<u8> {
     if leaves.is_empty() {
         return vec![0u8; 32];
@@ -112,7 +105,6 @@ fn merkle_root(leaves: &[Vec<u8>]) -> Vec<u8> {
                 hasher.update(&level[i + 1]);
                 next.push(hasher.finalize().as_bytes().to_vec());
             } else {
-                // Odd node: promote as-is
                 next.push(level[i].clone());
             }
             i += 2;
