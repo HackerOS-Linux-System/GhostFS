@@ -4,8 +4,8 @@ use crate::error::HfsError;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct UserQuota {
-    pub limit: u64,   // bytes; 0 = unlimited
-    pub used:  u64,   // bytes currently consumed
+    pub limit: u64,
+    pub used:  u64,
 }
 
 pub struct Quota {
@@ -36,7 +36,6 @@ impl Quota {
         Ok(())
     }
 
-    /// Check whether uid can allocate `additional` more bytes.
     pub fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
         let q = self.get_quota(uid)?;
         if q.limit > 0 && q.used.saturating_add(additional) > q.limit {
@@ -45,28 +44,24 @@ impl Quota {
         Ok(())
     }
 
-    /// Increment the usage counter for uid.
     pub fn update_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
         let mut q = self.get_quota(uid)?;
         q.used = q.used.saturating_add(delta);
         self.set_quota(uid, &q)
     }
 
-    /// Decrement the usage counter (e.g. after unlink).
     pub fn release_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
         let mut q = self.get_quota(uid)?;
         q.used = q.used.saturating_sub(delta);
         self.set_quota(uid, &q)
     }
 
-    /// Set the hard limit for uid (bytes; 0 = unlimited).
     pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), HfsError> {
         let mut q = self.get_quota(uid)?;
         q.limit = limit;
         self.set_quota(uid, &q)
     }
 
-    /// Pretty-print quota info for uid (used by CLI).
     pub fn show(&self, uid: u32) -> Result<(), HfsError> {
         let q = self.get_quota(uid)?;
         let limit_str = if q.limit == 0 {
