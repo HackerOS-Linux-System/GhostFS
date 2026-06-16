@@ -5,8 +5,6 @@ use crate::error::HfsError;
 const JOURNAL_PREFIX: &str = "journal:seq:";
 const JOURNAL_HEAD: &[u8] = b"journal:head";
 const JOURNAL_COMMITTED: &[u8] = b"journal:committed";
-/// Flush the sled tree to disk on every commit barrier.
-/// In a production build this maps to fdatasync(2).
 const SYNC_ON_BARRIER: bool = true;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -14,7 +12,6 @@ pub enum JournalOp {
     WriteBlock {
         ino: u64,
         block_idx: usize,
-        /// Previous content of the block (None if block was absent)
         before: Option<Vec<u8>>,
     },
     DeleteBlock {
@@ -61,7 +58,6 @@ impl Journal {
         })
     }
 
-    /// Append a write-block record to the journal.
     pub fn log_write(
         &self,
         ino: u64,
@@ -84,13 +80,11 @@ impl Journal {
         Ok(())
     }
 
-    /// Commit barrier — mark all pending records as committed and optionally sync.
     pub fn commit_barrier(&self) -> Result<(), HfsError> {
         let head: u64 = match self.db.get(JOURNAL_HEAD)? {
             Some(v) => bincode::deserialize(&v)?,
             None => 0,
         };
-        // Mark every pending record as committed
         let committed = self.last_committed()?;
         for seq in committed..head {
             let key = format!("{}{}", JOURNAL_PREFIX, seq);
@@ -105,7 +99,6 @@ impl Journal {
         if SYNC_ON_BARRIER {
             self.db.flush()?;
         }
-        // Prune committed records older than 256 entries to keep journal compact
         if head > 256 {
             let prune_before = head - 256;
             for seq in 0..prune_before {
@@ -116,7 +109,6 @@ impl Journal {
         Ok(())
     }
 
-    /// Replay uncommitted records on startup for crash recovery.
     pub fn recover(&self, _db: &Db) -> Result<(), HfsError> {
         let committed = self.last_committed()?;
         let head: u64 = match self.db.get(JOURNAL_HEAD)? {
@@ -124,7 +116,7 @@ impl Journal {
             None => 0,
         };
         if head == committed {
-            return Ok(()); // clean journal
+            return Ok(());
         }
         log::warn!(
             "GhostFS journal recovery: replaying {} uncommitted records",
@@ -135,7 +127,6 @@ impl Journal {
             if let Some(raw) = self.db.get(key.as_bytes())? {
                 let record: JournalRecord = bincode::deserialize(&raw)?;
                 if !record.committed {
-                    // Undo: restore the 'before' image
                     match &record.op {
                         JournalOp::WriteBlock { ino, block_idx, before } |
                         JournalOp::DeleteBlock { ino, block_idx, before } => {
@@ -163,7 +154,6 @@ impl Journal {
                 }
             }
         }
-        // Reset head to committed after undo
         self.db.insert(JOURNAL_HEAD, bincode::serialize(&committed)?)?;
         self.db.flush()?;
         log::info!("GhostFS journal recovery complete.");
