@@ -19,10 +19,11 @@ pub struct Crypto {
 impl Crypto {
     pub fn new(key: Key) -> Result<Self, HfsError> {
         let master_cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|_| HfsError::CryptoError)?;
+            .map_err(|_| HfsError::CryptoError)?;
         Ok(Self { master_key: key, master_cipher })
     }
 
+    /// Derive per-inode File Encryption Key: FEK = BLAKE3-KDF(master, ino).
     pub fn derive_fek(&self, ino: u64) -> Key {
         let mut hasher = Hasher::new_keyed(&self.master_key);
         hasher.update(FEK_CONTEXT);
@@ -34,8 +35,8 @@ impl Crypto {
         let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self.master_cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
-        .map_err(|_| HfsError::CryptoError)?;
+            .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
+            .map_err(|_| HfsError::CryptoError)?;
         let mut r = nonce_bytes.to_vec();
         r.extend_from_slice(&ciphertext);
         Ok(r)
@@ -45,8 +46,8 @@ impl Crypto {
         if encrypted.len() < NONCE_SIZE { return Err(HfsError::CryptoError); }
         let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
         self.master_cipher
-        .decrypt(nonce, Payload { msg: &encrypted[NONCE_SIZE..], aad: b"" })
-        .map_err(|_| HfsError::CryptoError)
+            .decrypt(nonce, Payload { msg: &encrypted[NONCE_SIZE..], aad: b"" })
+            .map_err(|_| HfsError::CryptoError)
     }
 
     pub fn encrypt_with_key(&self, fek: &Key, plaintext: &[u8]) -> Result<Vec<u8>, HfsError> {
@@ -54,8 +55,8 @@ impl Crypto {
         let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
-        .map_err(|_| HfsError::CryptoError)?;
+            .encrypt(nonce, Payload { msg: plaintext, aad: b"" })
+            .map_err(|_| HfsError::CryptoError)?;
         let mut r = nonce_bytes.to_vec();
         r.extend_from_slice(&ciphertext);
         Ok(r)
@@ -66,10 +67,11 @@ impl Crypto {
         let cipher = Aes256Gcm::new_from_slice(fek).map_err(|_| HfsError::CryptoError)?;
         let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
         cipher
-        .decrypt(nonce, Payload { msg: &encrypted[NONCE_SIZE..], aad: b"" })
-        .map_err(|_| HfsError::CryptoError)
+            .decrypt(nonce, Payload { msg: &encrypted[NONCE_SIZE..], aad: b"" })
+            .map_err(|_| HfsError::CryptoError)
     }
 
+    /// Zero key material from memory (call on unmount).
     pub fn zeroize(&mut self) {
         self.master_key.zeroize();
     }
