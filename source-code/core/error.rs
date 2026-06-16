@@ -1,4 +1,3 @@
-
 use std::io;
 use thiserror::Error;
 
@@ -60,6 +59,9 @@ pub enum HfsError {
 
     #[error("Permission denied")]
     PermissionDenied,
+
+    #[error("TPM error: {0}")]
+    TpmError(String),
 }
 
 impl From<HfsError> for libc::c_int {
@@ -73,6 +75,7 @@ impl From<HfsError> for libc::c_int {
             HfsError::MacDenied          => libc::EACCES,
             HfsError::PermissionDenied   => libc::EACCES,
             HfsError::SuperblockTampered => libc::EIO,
+            HfsError::TpmError(_)        => libc::EIO,
             _                            => libc::EIO,
         }
     }
