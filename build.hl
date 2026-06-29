@@ -16,3 +16,6 @@
 ;; ./target/release/hfs mkfs --device /path/to/db
 ;; Montowanie (wymuszone szyfrowanie z kluczem)
 ;; ./target/release/hfs mount --device /path/to/db --mountpoint /mnt/hfs --key-file key.txt
+
+;; > sudo apt install libfuse3-dev
+;; install dependeces ^^^^^
