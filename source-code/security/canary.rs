@@ -1,112 +1,195 @@
 use sled::Db;
 use serde::{Serialize, Deserialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::HfsError;
-use crate::ids::{Ids, AlertKind};
+use crate::ids::Ids;
+
+const CANARY_KEY_DB:       &[u8] = b"canary:hmac_key";
+const CANARY_ENDPOINT_DB:  &[u8] = b"canary:endpoint";
+const CANARY_INTERVAL_DB:  &[u8] = b"canary:interval_secs";
+const DEFAULT_INTERVAL:    u64   = 300; // 5 minut
+const BEACON_TIMEOUT_SECS: u64  = 10;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CanaryConfig {
-    /// URL do którego wysyłany jest beacon (HTTP GET), None = tylko log lokalny
-    pub beacon_url: Option<String>,
-    /// Opis pliku (niewidoczny dla atakującego)
-    pub description: String,
+pub struct BeaconPayload {
+    pub hostname:     String,
+    pub timestamp_us: u128,
+    pub seq:          u64,
+    pub volume_id:    String,
+    /// HMAC-BLAKE3 nad (timestamp_us || seq || volume_id), klucz z DB.
+    pub hmac:         String,
 }
 
+#[derive(Clone)]
 pub struct Canary {
-    db:  Db,
-    ids: Ids,
+    db:     Db,
+    /// Sekwencja beaconu — inkrementowana przy każdym wysłaniu.
+    seq_key: String,
 }
 
 impl Canary {
-    pub fn new(db: &Db, ids: &Ids) -> Result<Self, HfsError> {
-        Ok(Self { db: db.clone(), ids: ids.clone() })
+    pub fn new(db: &Db, _ids: &Ids) -> Result<Self, HfsError> {
+        Ok(Self {
+            db:      db.clone(),
+            seq_key: "canary:seq".to_string(),
+        })
     }
 
-    /// Oznacz inode jako canary file.
-    pub fn mark(&self, ino: u64, config: CanaryConfig) -> Result<(), HfsError> {
-        let key = format!("canary:{}", ino);
-        self.db.insert(key.as_bytes(), bincode::serialize(&config)?)?;
-        log::info!("GhostFS canary: ino={} marked ({})", ino, config.description);
+    /// Skonfiguruj canary przy mkfs/mount.
+    /// `hmac_key` — 32-bajtowy klucz HMAC (hex), `endpoint` — HTTPS URL,
+    /// `interval_secs` — interwał beaconu.
+    pub fn configure(
+        &self,
+        hmac_key_hex: &str,
+        endpoint:     &str,
+        interval_secs: u64,
+    ) -> Result<(), HfsError> {
+        if !endpoint.starts_with("https://") {
+            return Err(HfsError::InvalidArgument(
+                "Canary endpoint must use HTTPS (e.g. https://siem.example.com/canary)".into()
+            ));
+        }
+        let key_bytes = hex::decode(hmac_key_hex)
+            .map_err(|_| HfsError::InvalidArgument("Invalid canary HMAC key (must be hex)".into()))?;
+        if key_bytes.len() != 32 {
+            return Err(HfsError::InvalidArgument("Canary HMAC key must be 32 bytes (64 hex chars)".into()));
+        }
+        self.db.insert(CANARY_KEY_DB,      key_bytes)?;
+        self.db.insert(CANARY_ENDPOINT_DB, endpoint.as_bytes())?;
+        self.db.insert(CANARY_INTERVAL_DB, bincode::serialize(&interval_secs)?)?;
+        log::info!("GhostFS canary: configured endpoint={} interval={}s", endpoint, interval_secs);
         Ok(())
     }
 
-    /// Usuń oznaczenie canary.
-    pub fn unmark(&self, ino: u64) -> Result<(), HfsError> {
-        let key = format!("canary:{}", ino);
-        self.db.remove(key.as_bytes())?;
-        Ok(())
-    }
-
-    /// Sprawdź czy inode jest canary — wywołać przy każdym open()/read().
-    /// Jeśli tak: emituj alert i opcjonalnie wyślij beacon.
-    pub fn check_and_trigger(&self, ino: u64, uid: u32) -> Result<(), HfsError> {
-        let key = format!("canary:{}", ino);
-        if let Some(raw) = self.db.get(key.as_bytes())? {
-            let config: CanaryConfig = bincode::deserialize(&raw)?;
-            let detail = format!(
-                "CANARY TRIGGERED: ino={} uid={} desc='{}'",
-                ino, uid, config.description
-            );
-            log::error!("[GhostFS CANARY] {}", detail);
-
-            self.ids.emit_alert(uid, AlertKind::CanaryTriggered { ino }, &detail)?;
-
-            // Beacon — fire and forget w osobnym wątku
-            if let Some(url) = config.beacon_url {
-                let beacon_detail = detail.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = Self::send_beacon(&url, &beacon_detail) {
-                        log::warn!("Canary beacon failed: {}", e);
-                    }
-                });
+    fn load_hmac_key(&self) -> Result<Option<[u8; 32]>, HfsError> {
+        match self.db.get(CANARY_KEY_DB)? {
+            Some(v) if v.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&v);
+                Ok(Some(arr))
             }
+            _ => Ok(None),
+        }
+    }
+
+    fn load_endpoint(&self) -> Result<Option<String>, HfsError> {
+        match self.db.get(CANARY_ENDPOINT_DB)? {
+            Some(v) => Ok(Some(String::from_utf8(v.to_vec()).map_err(HfsError::Utf8)?)),
+            None    => Ok(None),
+        }
+    }
+
+    fn load_interval(&self) -> Result<u64, HfsError> {
+        match self.db.get(CANARY_INTERVAL_DB)? {
+            Some(v) => Ok(bincode::deserialize(&v)?),
+            None    => Ok(DEFAULT_INTERVAL),
+        }
+    }
+
+    fn next_seq(&self) -> Result<u64, HfsError> {
+        let seq: u64 = match self.db.get(self.seq_key.as_bytes())? {
+            Some(v) => bincode::deserialize(&v)?,
+            None    => 0,
+        };
+        self.db.insert(self.seq_key.as_bytes(), bincode::serialize(&(seq + 1))?)?;
+        Ok(seq)
+    }
+
+    fn compute_hmac(key: &[u8; 32], timestamp_us: u128, seq: u64, volume_id: &str) -> String {
+        let mut h = blake3::Hasher::new_keyed(key);
+        h.update(&timestamp_us.to_le_bytes());
+        h.update(&seq.to_le_bytes());
+        h.update(volume_id.as_bytes());
+        hex::encode(h.finalize().as_bytes())
+    }
+
+    /// Wyślij pojedynczy beacon HTTPS z HMAC.
+    /// Wymaga feature `reqwest` z TLS. Blokuje wątek przez maksymalnie BEACON_TIMEOUT_SECS.
+    #[cfg(feature = "canary-https")]
+    pub fn send_beacon(&self) -> Result<(), HfsError> {
+        let hmac_key = match self.load_hmac_key()? {
+            Some(k) => k,
+            None    => {
+                log::debug!("GhostFS canary: not configured, skipping beacon");
+                return Ok(());
+            }
+        };
+        let endpoint = match self.load_endpoint()? {
+            Some(e) => e,
+            None    => return Ok(()),
+        };
+
+        let timestamp_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        let seq       = self.next_seq()?;
+        let hostname  = hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let volume_id = hex::encode(&hmac_key[..8]); // pierwsze 8 bajtów klucza jako vol-id
+
+        let hmac = Self::compute_hmac(&hmac_key, timestamp_us, seq, &volume_id);
+
+        let payload = BeaconPayload {
+            hostname, timestamp_us, seq, volume_id, hmac,
+        };
+
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| HfsError::InvalidArgument(format!("Beacon JSON error: {}", e)))?;
+
+        // reqwest blocking z TLS (native-tls lub rustls według Cargo.toml).
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(BEACON_TIMEOUT_SECS))
+            .https_only(true)           // wymuś HTTPS — odrzuć przekierowania na HTTP
+            .build()
+            .map_err(|e| HfsError::InvalidArgument(format!("HTTP client error: {}", e)))?;
+
+        let resp = client
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("X-GhostFS-Version", env!("CARGO_PKG_VERSION"))
+            .body(json)
+            .send()
+            .map_err(|e| {
+                log::warn!("GhostFS canary beacon failed: {}", e);
+                HfsError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))
+            })?;
+
+        if resp.status().is_success() {
+            log::debug!("GhostFS canary: beacon sent (seq={} status={})", seq, resp.status());
+        } else {
+            log::warn!("GhostFS canary: beacon rejected by server (status={})", resp.status());
         }
         Ok(())
     }
 
-    /// Wyślij beacon HTTP GET (bez zewnętrznych crate — używa std TcpStream).
-    fn send_beacon(url: &str, detail: &str) -> Result<(), String> {
-        use std::io::Write;
-        use std::net::TcpStream;
-
-        // Parsuj URL ręcznie (bez reqwest aby uniknąć zależności)
-        let url = url.trim_start_matches("http://");
-        let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
-        let path = format!("/{}?detail={}", path, urlencodeish(detail));
-        let host = host_port.split(':').next().unwrap_or(host_port);
-        let port: u16 = host_port.split(':').nth(1)
-            .and_then(|p| p.parse().ok()).unwrap_or(80);
-
-        let mut stream = TcpStream::connect((host, port))
-            .map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
-        let req = format!("GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: ghostfs-canary/0.3\r\n\r\n", path, host);
-        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    /// Wersja bez featu https — loguje ostrzeżenie i działa jako no-op.
+    #[cfg(not(feature = "canary-https"))]
+    pub fn send_beacon(&self) -> Result<(), HfsError> {
+        log::warn!(
+            "GhostFS canary: compiled without 'canary-https' feature — \
+             beacon not sent. Add reqwest to dependencies and enable the feature."
+        );
         Ok(())
     }
 
-    /// Lista wszystkich canary ino w wolumenie.
-    pub fn list_canaries(&self) -> Result<Vec<(u64, CanaryConfig)>, HfsError> {
-        let mut out = Vec::new();
-        for item in self.db.scan_prefix(b"canary:") {
-            let (k, v) = item?;
-            let k_str  = String::from_utf8(k.to_vec())?;
-            if let Some(ino_str) = k_str.strip_prefix("canary:") {
-                if let Ok(ino) = ino_str.parse::<u64>() {
-                    if let Ok(cfg) = bincode::deserialize::<CanaryConfig>(&v) {
-                        out.push((ino, cfg));
+    /// Uruchom wątek tła wysyłający beacony co `interval_secs`.
+    pub fn start_background_beacon(&self) {
+        let canary = self.clone();
+        std::thread::Builder::new()
+            .name("ghostfs-canary".into())
+            .spawn(move || {
+                let interval = canary.load_interval().unwrap_or(DEFAULT_INTERVAL);
+                log::info!("GhostFS canary: background beacon thread started (interval={}s)", interval);
+                loop {
+                    std::thread::sleep(Duration::from_secs(interval));
+                    if let Err(e) = canary.send_beacon() {
+                        log::error!("GhostFS canary: beacon error: {}", e);
                     }
                 }
-            }
-        }
-        Ok(out)
+            })
+            .ok();
     }
-}
-
-fn urlencodeish(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-        ' ' => "+".to_string(),
-        c   => format!("%{:02X}", c as u32),
-    }).collect()
 }
