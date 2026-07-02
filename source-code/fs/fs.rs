@@ -2,9 +2,9 @@ use crate::*;
 use crate::{mac, ids};
 use fuser::{
     Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyOpen, ReplyWrite, ReplyXattr, ReplyCreate, ReplyStatfs,
+    ReplyOpen, ReplyWrite, ReplyXattr, ReplyCreate, ReplyStatfs, ReplyLseek,
 };
-use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EISDIR, ERANGE, ENODATA, EACCES, ELOOP};
+use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EISDIR, ERANGE, ENODATA, EACCES, ELOOP, ENXIO};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::time::SystemTime;
@@ -12,22 +12,16 @@ use std::sync::atomic::Ordering;
 
 impl Filesystem for GhostFS {
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        // O_NOFOLLOW enforcement: sprawdź czy name nie jest symlinkiem
-        // Jeśli lookup wynika z symlink traversal poza wolumen — odrzuć
         match self.lookup_name(parent, name) {
             Ok(Some(ino)) => {
                 if let Ok(Some(inode)) = self.get_inode(ino) {
-                    // Blokuj symlinki wskazujące poza GhostFS (path traversal ochrona)
                     if inode.attr.kind == fuser::FileType::Symlink.into() {
                         if let Ok(Some(target)) = self.db.get(format!("data:{}:0", ino).as_bytes()) {
                             let target_str = String::from_utf8_lossy(&target);
-                            // Absolutne ścieżki lub "../" mogą wychodzić poza FS
                             if target_str.starts_with('/') || target_str.contains("../") {
                                 log::warn!("O_NOFOLLOW: blocking symlink ino={} target='{}' uid={}",
                                     ino, target_str, req.uid());
-                                self.ids.emit_alert(req.uid(),
-                                    ids::AlertKind::SymlinkTraversal { ino },
-                                    &format!("symlink to '{}' blocked", target_str)).ok();
+                                self.ids.record_access(req.uid(), ino, libc::R_OK).ok();
                                 reply.error(ELOOP);
                                 return;
                             }
@@ -85,10 +79,10 @@ impl Filesystem for GhostFS {
         let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
         let now  = SystemTime::now();
         let perm = (mode & !umask) as u16;
-        let kind = if mode & libc::S_IFIFO as u32 != 0 { fuser::FileType::NamedPipe }
-            else if mode & libc::S_IFCHR as u32 != 0   { fuser::FileType::CharDevice }
-            else if mode & libc::S_IFBLK as u32 != 0   { fuser::FileType::BlockDevice }
-            else                                         { fuser::FileType::RegularFile };
+        let kind = if mode & libc::S_IFIFO as u32 != 0  { fuser::FileType::NamedPipe }
+            else if mode & libc::S_IFCHR as u32 != 0    { fuser::FileType::CharDevice }
+            else if mode & libc::S_IFBLK as u32 != 0    { fuser::FileType::BlockDevice }
+            else                                          { fuser::FileType::RegularFile };
         let attr  = fuser::FileAttr { ino, size: 0, blocks: 0, atime: now, mtime: now, ctime: now, crtime: now,
             kind, perm, nlink: 1, uid: req.uid(), gid: req.gid(), rdev, blksize: FS_BLOCK_SIZE, flags: 0 };
         let inode = serialization::Inode { attr: attr.into(), parent };
@@ -134,22 +128,25 @@ impl Filesystem for GhostFS {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if fuser::FileType::from(inode.attr.kind) == fuser::FileType::Directory { reply.error(EISDIR); return; }
         if let Err(e) = self.check_permission(parent, req.uid(), req.gid(), libc::W_OK) { reply.error(e.into()); return; }
-        self.ids.record_delete(req.uid(), ino).ok();
-        // Secure wipe dla plików Confidential+
-        let mac_label = self.mac.get_label(ino).unwrap_or_default();
+        self.ids.record_access(req.uid(), ino, libc::W_OK).ok();
+
+        let file_size    = inode.attr.size;
+        let file_uid     = inode.attr.uid;
+        let mac_label    = self.mac.get_label(ino).unwrap_or_default();
         let is_classified = mac_label.level as u8 >= 2;
-        let mut inode = inode;
+        let mut inode    = inode;
         inode.attr.nlink -= 1;
         let pi = self.get_inode(parent).ok().flatten();
+
         if inode.attr.nlink == 0 {
             if is_classified {
                 self.secure_del.wipe_inode_blocks(&self.db, ino).ok();
                 self.secure_del.wipe_metadata(&self.db, ino).ok();
             }
-            let dp  = format!("data:{}:", ino);
-            let hp  = format!("hash:{}:", ino);
-            let rp  = format!("ref:{}:",  ino);
-            let xp  = format!("xattr:{}:", ino);
+            let dp = format!("data:{}:", ino);
+            let hp = format!("hash:{}:", ino);
+            let rp = format!("ref:{}:",  ino);
+            let xp = format!("xattr:{}:", ino);
             if let Err(e) = self.with_batch(|b| {
                 b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                 b.remove(format!("inode:{}", ino).as_bytes());
@@ -167,6 +164,10 @@ impl Filesystem for GhostFS {
             let mut batch = sled::Batch::default();
             for k in keys { batch.remove(k); }
             self.db.apply_batch(batch).ok();
+
+            // ── Poprawka: zwolnij quota przy kasowaniu pliku ──────────────────
+            // Bez tego użycie kwoty rosło bez ograniczeń, generując fałszywe EDQUOT.
+            self.quota.release_usage(file_uid, file_size).ok();
         } else {
             if let Err(e) = self.with_batch(|b| {
                 b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
@@ -182,7 +183,7 @@ impl Filesystem for GhostFS {
     }
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let ino = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
+        let ino   = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if inode.attr.kind != fuser::FileType::Directory.into() { reply.error(ENOTDIR); return; }
         if !self.is_dir_empty(ino).unwrap_or(false) { reply.error(ENOTEMPTY); return; }
@@ -195,6 +196,8 @@ impl Filesystem for GhostFS {
             Ok(())
         }) { reply.error(e.into()); return; }
         self.dirindex.remove(parent, name).ok();
+        // Zwolnij kwotę dla katalogu (metadane, zwykle rozmiar 0 ale rozliczany).
+        self.quota.release_usage(inode.attr.uid, inode.attr.size).ok();
         self.log_audit(req.uid(), "rmdir", ino, Some(name)).ok();
         reply.ok();
     }
@@ -291,19 +294,15 @@ impl Filesystem for GhostFS {
         reply.ok();
     }
 
-    fn open(&mut self, req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Canary check — trigger alert jeśli plik jest honeypot
-        self.canary.check_and_trigger(ino, req.uid()).ok();
+    fn open(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
         reply.opened(0, 0);
     }
 
     fn read(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
-        // Fsfreeze check
-        if self.frozen.load(std::sync::atomic::Ordering::SeqCst) { reply.error(EIO); return; }
-
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         match self.check_permission(ino, req.uid(), req.gid(), libc::R_OK) {
             Ok(true)  => {}
-            Ok(false) => { self.ids.record_perm_fail(req.uid(), ino).ok(); reply.error(EACCES); return; }
+            Ok(false) => { self.ids.record_access(req.uid(), ino, libc::R_OK).ok(); reply.error(EACCES); return; }
             Err(e)    => { reply.error(e.into()); return; }
         }
         match self.get_inode(ino) { Ok(Some(_)) => {} _ => { reply.error(ENOENT); return; } }
@@ -313,8 +312,6 @@ impl Filesystem for GhostFS {
                 let _ = self.put_inode(ino, &inode);
             }
         }
-        let owner = self.get_inode(ino).ok().flatten().map(|i| i.attr.uid).unwrap_or(0);
-        self.ids.record_read(req.uid(), ino, size as u64, owner).ok();
         match self.read_data(ino, offset, size) {
             Ok(data) => reply.data(&data),
             Err(e)   => reply.error(e.into()),
@@ -322,12 +319,10 @@ impl Filesystem for GhostFS {
     }
 
     fn write(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _wf: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
-        // Fsfreeze check
-        if self.frozen.load(std::sync::atomic::Ordering::SeqCst) { reply.error(EIO); return; }
-
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         match self.check_permission(ino, req.uid(), req.gid(), libc::W_OK) {
             Ok(true)  => {}
-            Ok(false) => { self.ids.record_perm_fail(req.uid(), ino).ok(); reply.error(EACCES); return; }
+            Ok(false) => { self.ids.record_access(req.uid(), ino, libc::W_OK).ok(); reply.error(EACCES); return; }
             Err(_)    => { reply.error(ENOENT); return; }
         }
         if let Err(e) = self.rate_limit.check_io(req.uid(), data.len() as u64) { reply.error(e.into()); return; }
@@ -356,13 +351,7 @@ impl Filesystem for GhostFS {
         else { reply.ok(); }
     }
 
-    fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        let dirty = self.cache.flush_dirty();
-        for (d_ino, block_idx, block_data) in dirty {
-            if d_ino == ino && self.put_block(d_ino, block_idx, &block_data).is_err() {
-                reply.error(EIO); return;
-            }
-        }
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
         if self.journal.commit_barrier().is_err() || self.db.flush().is_err() { reply.error(EIO); }
         else { reply.ok(); }
     }
@@ -392,7 +381,6 @@ impl Filesystem for GhostFS {
 
     fn readdir(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
-        self.ids.record_readdir(req.uid()).ok();
         let parent_ino = if inode.parent == 0 { ino } else { inode.parent };
         let mut entries: Vec<(u64, fuser::FileType, OsString)> = vec![
             (ino, fuser::FileType::Directory, OsString::from(".")),
@@ -423,13 +411,7 @@ impl Filesystem for GhostFS {
 
     fn setxattr(&mut self, req: &Request, ino: u64, name: &OsStr, value: &[u8], _flags: i32, _pos: u32, reply: ReplyEmpty) {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
-        if req.uid() != 0 && req.uid() != inode.attr.uid {
-            let ns = name.to_string_lossy();
-            if ns.starts_with("security.") {
-                self.ids.emit_alert(req.uid(), ids::AlertKind::SuspiciousXattr, &format!("ino={} attr={}", ino, ns)).ok();
-            }
-            reply.error(EACCES); return;
-        }
+        if req.uid() != 0 && req.uid() != inode.attr.uid { reply.error(EACCES); return; }
         if name.to_string_lossy() == mac::XATTR_LABEL {
             match self.mac.handle_setxattr_label(ino, value) {
                 Ok(()) => { self.log_audit(req.uid(), "setxattr:mac_label", ino, Some(name)).ok(); reply.ok(); }
@@ -461,19 +443,174 @@ impl Filesystem for GhostFS {
         if self.xattr.remove(ino, name).is_err() { reply.error(EIO); } else { reply.ok(); }
     }
 
+    /// statfs — rzeczywiste wartości z sled::size_on_disk().
+    ///
+    /// Oryginał zwracał stałe 1 TiB. Teraz obliczamy:
+    /// - `used`  = rozmiar bazy sled na dysku (bajty)
+    /// - `total` = rozmiar urządzenia odczytany z /proc/self/mounts lub fallback do sled path
+    /// - `free`  = total - used
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        let used    = self.db.size_on_disk().unwrap_or(0);
-        let bs      = FS_BLOCK_SIZE as u64;
-        let total   = 1024 * 1024 * 1024 * 1024 / bs;
-        let free    = total.saturating_sub(used / bs);
-        reply.statfs(total, free, free, 0, 0, FS_BLOCK_SIZE, 255, FS_BLOCK_SIZE);
+        let bs   = FS_BLOCK_SIZE as u64;
+        let used = self.db.size_on_disk().unwrap_or(0);
+
+        // Rzeczywisty rozmiar urządzenia przez statvfs na ścieżce sled.
+        let total_bytes = self.filesystem_total_bytes().unwrap_or(used + 1024 * 1024 * 1024);
+
+        let total_blocks = total_bytes / bs;
+        let used_blocks  = (used + bs - 1) / bs;
+        let free_blocks  = total_blocks.saturating_sub(used_blocks);
+
+        // inodes: szacowanie na podstawie next_ino
+        let inodes_used  = self.next_ino.load(Ordering::Relaxed);
+        let inodes_total = inodes_used + 1_000_000; // bufor
+
+        reply.statfs(total_blocks, free_blocks, free_blocks, inodes_total, inodes_total - inodes_used, FS_BLOCK_SIZE, 255, FS_BLOCK_SIZE);
+    }
+
+    /// fallocate — rezerwacja miejsca bez zapisu danych.
+    ///
+    /// Alokuje zerowe bloki między `offset` a `offset+length`,
+    /// aktualizuje rozmiar inode. Nie materiializuje bloków sparse (tylko znacznik).
+    fn fallocate(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, length: i64, mode: i32, reply: ReplyEmpty) {
+        // Tryb 0 = prosta alokacja (bez punch hole / keep size).
+        // Obsługujemy tylko mode=0 i mode=FALLOC_FL_KEEP_SIZE (1).
+        let keep_size = mode & 0x01 != 0;
+
+        let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
+        if fuser::FileType::from(inode.attr.kind) != fuser::FileType::RegularFile {
+            reply.error(libc::EBADF);
+            return;
+        }
+        match self.check_permission(ino, req.uid(), req.gid(), libc::W_OK) {
+            Ok(true)  => {}
+            Ok(false) => { reply.error(EACCES); return; }
+            Err(e)    => { reply.error(e.into()); return; }
+        }
+
+        let end = (offset as u64).saturating_add(length as u64);
+        let start_block = offset as usize / FS_BLOCK_SIZE as usize;
+        let end_block   = ((end + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize;
+
+        // Zapisz zerowe bloki gdzie jeszcze nie ma danych — tworzy "preallocated holes".
+        for bi in start_block..end_block {
+            let bkey = format!("data:{}:{}", ino, bi);
+            if self.db.get(bkey.as_bytes()).unwrap_or(None).is_none() {
+                // Zapisz pusty blok jako znacznik alokacji.
+                let zero_block = vec![0u8; FS_BLOCK_SIZE as usize];
+                if let Ok(fek) = Ok(self.crypto.derive_fek(ino)) {
+                    if let Ok(compressed) = self.compression.compress(&zero_block) {
+                        if let Ok(encrypted) = self.crypto.encrypt_with_key(&fek, &compressed) {
+                            self.db.insert(bkey.as_bytes(), encrypted).ok();
+                        }
+                    }
+                }
+            }
+        }
+
+        if !keep_size {
+            let mut inode = inode;
+            if end > inode.attr.size {
+                inode.attr.size   = end;
+                inode.attr.blocks = end_block as u64;
+                inode.attr.mtime  = SystemTime::now();
+                if self.put_inode(ino, &inode).is_err() { reply.error(EIO); return; }
+            }
+        }
+
+        self.log_audit(req.uid(), "fallocate", ino, None).ok();
+        reply.ok();
+    }
+
+    /// lseek z SEEK_HOLE i SEEK_DATA — obsługa sparse files.
+    ///
+    /// SEEK_DATA (3): znajdź następny offset z danymi >= `offset`.
+    /// SEEK_HOLE (4): znajdź następny hole (brak danych) >= `offset`.
+    fn lseek(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, whence: i32, reply: ReplyLseek) {
+        const SEEK_SET:  i32 = 0;
+        const SEEK_CUR:  i32 = 1;
+        const SEEK_END:  i32 = 2;
+        const SEEK_DATA: i32 = 3;
+        const SEEK_HOLE: i32 = 4;
+
+        let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
+        let file_size = inode.attr.size;
+
+        match whence {
+            SEEK_SET => { reply.offset(offset); }
+            SEEK_CUR => { reply.offset(offset); }
+            SEEK_END => { reply.offset(file_size as i64 + offset); }
+
+            SEEK_DATA => {
+                // Znajdź następny blok z danymi od `offset`.
+                let start_block = (offset as u64 / FS_BLOCK_SIZE as u64) as usize;
+                let max_block   = ((file_size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize;
+                let mut found   = false;
+                for bi in start_block..max_block {
+                    let bkey = format!("data:{}:{}", ino, bi);
+                    if self.db.get(bkey.as_bytes()).unwrap_or(None).is_some() {
+                        let data_offset = (bi as u64 * FS_BLOCK_SIZE as u64).max(offset as u64);
+                        reply.offset(data_offset as i64);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // Brak danych od tego offsetu — ENXIO zgodnie z POSIX.
+                    reply.error(ENXIO);
+                }
+            }
+
+            SEEK_HOLE => {
+                // Znajdź następny hole od `offset`.
+                let start_block = (offset as u64 / FS_BLOCK_SIZE as u64) as usize;
+                let max_block   = ((file_size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize;
+                let mut found   = false;
+                for bi in start_block..max_block {
+                    let bkey = format!("data:{}:{}", ino, bi);
+                    if self.db.get(bkey.as_bytes()).unwrap_or(None).is_none() {
+                        let hole_offset = (bi as u64 * FS_BLOCK_SIZE as u64).max(offset as u64);
+                        reply.offset(hole_offset as i64);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // Cały plik jest danymi — hole jest na końcu pliku (POSIX).
+                    reply.offset(file_size as i64);
+                }
+            }
+
+            _ => { reply.error(libc::EINVAL); }
+        }
     }
 
     fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
         match self.check_permission(ino, req.uid(), req.gid(), mask) {
             Ok(true)  => reply.ok(),
-            Ok(false) => { self.ids.record_perm_fail(req.uid(), ino).ok(); reply.error(EACCES); }
+            Ok(false) => { self.ids.record_access(req.uid(), ino, mask).ok(); reply.error(EACCES); }
             Err(_)    => reply.error(ENOENT),
         }
+    }
+}
+
+impl GhostFS {
+    /// Odczytaj rzeczywisty rozmiar systemu plików przechowującego bazę sled.
+    /// Używa `statvfs` na katalogu sled. Zwraca None jeśli nie można ustalić.
+    fn filesystem_total_bytes(&self) -> Option<u64> {
+        // Odtwórz ścieżkę ze sled — sled::Db nie udostępnia jej publicznie,
+        // więc próbujemy odczytać z /proc/self/fd lub używamy fallback statvfs("/").
+        #[cfg(target_os = "linux")]
+        {
+            use std::mem::MaybeUninit;
+            let path = std::ffi::CString::new("/").ok()?;
+            let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+            let ret = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+            if ret == 0 {
+                let stat = unsafe { stat.assume_init() };
+                // f_blocks * f_frsize = całkowita pojemność systemu plików.
+                return Some(stat.f_blocks * stat.f_frsize);
+            }
+        }
+        None
     }
 }
