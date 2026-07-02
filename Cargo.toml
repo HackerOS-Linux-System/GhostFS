@@ -2,11 +2,11 @@
 name = "ghostfs"
 version = "0.3.0"
 edition = "2021"
-description = "GhostFS — production-grade cybersecurity filesystem for HackerOS"
+description = "GhostFS — cybersecurity filesystem for HackerOS"
 
 [lib]
 name = "ghostfs"
-path = "source-code/lib.rs"
+path = "source-code/fs/lib.rs"
 
 [[bin]]
 name = "ghostfs"
@@ -32,20 +32,29 @@ dashmap      = "5.5"
 crossbeam    = "0.8"
 thiserror    = "1.0"
 anyhow       = "1.0"
+argon2       = "0.5"
+zeroize      = { version = "1.7", features = ["derive"] }
+subtle       = "2.5"
+# Secure passphrase input (no terminal echo)
+rpassword    = "7.3"
+# gRPC streaming forensics
+tonic        = { version = "0.11", features = ["tls"] }
+prost        = "0.12"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+# TPM 2.0 key sealing (optional — requires tpm2-tss system library)
+tss-esapi    = { version = "7.5", optional = true }
 zstd         = { version = "0.13", optional = true }
 lz4          = { version = "1.24", optional = true }
-# P0: KDF - Argon2id key derivation
-argon2       = "0.5"
-# P0: Secure memory zeroing
-zeroize      = { version = "1.7", features = ["derive"] }
-# Constant-time comparison (timing attack mitigation)
-subtle       = "2.5"
 
 [features]
-default  = ["zstd", "lz4", "cybersec"]
-zstd     = ["dep:zstd"]
-lz4      = ["dep:lz4"]
-cybersec = []
+default = ["zstd", "lz4"]
+zstd    = ["dep:zstd"]
+lz4     = ["dep:lz4"]
+tpm     = ["dep:tss-esapi"]
+
+[build-dependencies]
+tonic-build = "0.11"
 
 [profile.release]
 opt-level     = 3
@@ -53,8 +62,3 @@ lto           = "fat"
 codegen-units = 1
 panic         = "abort"
 strip         = true
-
-[profile.release-dbg]
-inherits = "release"
-debug    = true
-strip    = false
