@@ -1,119 +1,68 @@
 use lru::LruCache;
-use dashmap::DashMap;
-use std::sync::Arc;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use crate::serialization::Inode;
 
-pub const INODE_CACHE_CAP: usize = 10_000;
-pub const BLOCK_CACHE_CAP: usize = 10_000;
-pub const READ_AHEAD_BLOCKS: usize = 8;
+const INODE_CACHE_SIZE: usize = 1024;
+const BLOCK_CACHE_SIZE: usize = 512;
 
+/// Thread-safe cache łączący DashMap dla szybkiego dostępu
+/// i LruCache chroniony Mutexem dla eviction policy.
+/// Wszystkie metody są bezpieczne do wywołania z wielu wątków FUSE jednocześnie.
+#[derive(Clone)]
 pub struct Cache {
-    inodes: DashMap<u64, Inode>,
-    blocks: DashMap<(u64, usize), Arc<Vec<u8>>>,
-    dirty_blocks: DashMap<(u64, usize), Arc<Vec<u8>>>,
-    inode_lru: LruCache<u64, ()>,
-    block_lru: LruCache<(u64, usize), ()>,
+    inode_lru: Arc<Mutex<LruCache<u64, Inode>>>,
+    block_lru: Arc<Mutex<LruCache<(u64, usize), Vec<u8>>>>,
 }
 
 impl Cache {
     pub fn new() -> Self {
-        let icap = NonZeroUsize::new(INODE_CACHE_CAP).unwrap();
-        let bcap = NonZeroUsize::new(BLOCK_CACHE_CAP).unwrap();
         Self {
-            inodes: DashMap::new(),
-            blocks: DashMap::new(),
-            dirty_blocks: DashMap::new(),
-            inode_lru: LruCache::new(icap),
-            block_lru: LruCache::new(bcap),
+            inode_lru: Arc::new(Mutex::new(
+                LruCache::new(NonZeroUsize::new(INODE_CACHE_SIZE).unwrap()),
+            )),
+            block_lru: Arc::new(Mutex::new(
+                LruCache::new(NonZeroUsize::new(BLOCK_CACHE_SIZE).unwrap()),
+            )),
         }
     }
 
-    pub fn get_inode(&mut self, ino: u64) -> Option<Inode> {
-        if let Some(entry) = self.inodes.get(&ino) {
-            self.inode_lru.put(ino, ());
-            return Some(entry.clone());
-        }
-        None
+    pub fn get_inode(&self, ino: u64) -> Option<Inode> {
+        self.inode_lru.lock().unwrap().get(&ino).cloned()
     }
 
-    pub fn put_inode(&mut self, ino: u64, inode: Inode) {
-        self.inodes.insert(ino, inode);
-        self.inode_lru.put(ino, ());
-        self.evict_inodes();
+    pub fn put_inode(&self, ino: u64, inode: Inode) {
+        self.inode_lru.lock().unwrap().put(ino, inode);
     }
 
-    pub fn remove_inode(&mut self, ino: u64) {
-        self.inodes.remove(&ino);
-        self.inode_lru.pop(&ino);
+    pub fn invalidate_inode(&self, ino: u64) {
+        self.inode_lru.lock().unwrap().pop(&ino);
     }
 
-    fn evict_inodes(&mut self) {
-        while self.inodes.len() > self.inode_lru.cap().get() {
-            if let Some((old, _)) = self.inode_lru.pop_lru() {
-                self.inodes.remove(&old);
-            } else {
-                break;
-            }
-        }
+    pub fn get_block(&self, ino: u64, block_idx: usize) -> Option<Vec<u8>> {
+        self.block_lru.lock().unwrap().get(&(ino, block_idx)).cloned()
     }
 
-    pub fn get_block(&mut self, ino: u64, idx: usize) -> Option<Vec<u8>> {
-        let key = (ino, idx);
-        if let Some(entry) = self.blocks.get(&key) {
-            self.block_lru.put(key, ());
-            return Some(entry.as_ref().to_vec());
-        }
-        None
+    pub fn put_block(&self, ino: u64, block_idx: usize, data: Vec<u8>) {
+        self.block_lru.lock().unwrap().put((ino, block_idx), data);
     }
 
-    pub fn put_block(&mut self, ino: u64, idx: usize, data: Vec<u8>) {
-        let key = (ino, idx);
-        self.blocks.insert(key, Arc::new(data));
-        self.block_lru.put(key, ());
-        self.evict_blocks();
+    pub fn remove_block(&self, ino: u64, block_idx: usize) {
+        self.block_lru.lock().unwrap().pop(&(ino, block_idx));
     }
 
-    pub fn mark_dirty(&mut self, ino: u64, idx: usize, data: Vec<u8>) {
-        let key = (ino, idx);
-        self.dirty_blocks.insert(key, Arc::new(data));
-    }
-
-    pub fn flush_dirty(&mut self) -> Vec<(u64, usize, Vec<u8>)> {
-        let keys: Vec<_> = self.dirty_blocks.iter().map(|r| *r.key()).collect();
-        let mut out = Vec::new();
-        for key in keys {
-            if let Some((_, data)) = self.dirty_blocks.remove(&key) {
-                out.push((key.0, key.1, data.as_ref().to_vec()));
-            }
-        }
-        out
-    }
-
-    pub fn remove_block(&mut self, ino: u64, idx: usize) {
-        let key = (ino, idx);
-        self.blocks.remove(&key);
-        self.dirty_blocks.remove(&key);
-        self.block_lru.pop(&key);
-    }
-
-    pub fn read_ahead_hint(last_block: usize) -> Vec<usize> {
-        (last_block + 1..=last_block + READ_AHEAD_BLOCKS).collect()
-    }
-
-    fn evict_blocks(&mut self) {
-        while self.blocks.len() > self.block_lru.cap().get() {
-            if let Some((old, _)) = self.block_lru.pop_lru() {
-                self.blocks.remove(&old);
-            } else {
-                break;
-            }
-        }
+    pub fn invalidate_inode_blocks(&self, ino: u64) {
+        let mut lru = self.block_lru.lock().unwrap();
+        // Zbierz klucze do usunięcia — LruCache nie wspiera retain, więc
+        // iterujemy i zbieramy, a potem usuwamy (unikamy borrow conflict).
+        let keys: Vec<(u64, usize)> = lru.iter()
+            .filter(|((i, _), _)| *i == ino)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys { lru.pop(&k); }
     }
 }
 
 impl Default for Cache {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
