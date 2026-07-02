@@ -2,80 +2,90 @@ use sled::Db;
 use serde::{Serialize, Deserialize};
 use crate::error::HfsError;
 
-#[derive(Serialize, Deserialize, Default, Clone)]
-pub struct UserQuota {
-    pub limit: u64,
-    pub used:  u64,
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuotaEntry {
+    pub limit:        u64,
+    pub used:         u64,
+    pub last_updated: u64,
 }
 
-pub struct Quota {
-    db: Db,
-}
+#[derive(Clone)]
+pub struct Quota { db: Db }
 
 impl Quota {
     pub fn new(db: &Db) -> Result<Self, HfsError> {
         Ok(Self { db: db.clone() })
     }
 
-    fn quota_key(uid: u32) -> String {
+    fn entry_key(uid: u32) -> String {
         format!("quota:{}", uid)
     }
 
-    pub fn get_quota(&self, uid: u32) -> Result<UserQuota, HfsError> {
-        match self.db.get(Self::quota_key(uid).as_bytes())? {
-            Some(v) => Ok(bincode::deserialize(&v)?),
-            None    => Ok(UserQuota::default()),
-        }
+    fn timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
-    fn set_quota(&self, uid: u32, quota: &UserQuota) -> Result<(), HfsError> {
-        self.db.insert(
-            Self::quota_key(uid).as_bytes(),
-                       bincode::serialize(quota)?,
-        )?;
+    pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), HfsError> {
+        let entry = match self.db.get(Self::entry_key(uid).as_bytes())? {
+            Some(v) => {
+                let mut e: QuotaEntry = bincode::deserialize(&v)?;
+                e.limit        = limit;
+                e.last_updated = Self::timestamp();
+                e
+            }
+            None => QuotaEntry { limit, used: 0, last_updated: Self::timestamp() },
+        };
+        self.db.insert(Self::entry_key(uid).as_bytes(), bincode::serialize(&entry)?)?;
         Ok(())
     }
 
     pub fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
-        let q = self.get_quota(uid)?;
-        if q.limit > 0 && q.used.saturating_add(additional) > q.limit {
-            return Err(HfsError::QuotaExceeded(uid));
+        match self.db.get(Self::entry_key(uid).as_bytes())? {
+            Some(v) => {
+                let e: QuotaEntry = bincode::deserialize(&v)?;
+                if e.limit > 0 && e.used + additional > e.limit {
+                    return Err(HfsError::QuotaExceeded(uid));
+                }
+            }
+            None => {} // Brak wpisu = brak limitu.
         }
         Ok(())
     }
 
+    /// Dodaj do użycia (przy zapisie).
     pub fn update_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
-        let mut q = self.get_quota(uid)?;
-        q.used = q.used.saturating_add(delta);
-        self.set_quota(uid, &q)
-    }
-
-    pub fn release_usage(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
-        let mut q = self.get_quota(uid)?;
-        q.used = q.used.saturating_sub(delta);
-        self.set_quota(uid, &q)
-    }
-
-    pub fn set_limit(&self, uid: u32, limit: u64) -> Result<(), HfsError> {
-        let mut q = self.get_quota(uid)?;
-        q.limit = limit;
-        self.set_quota(uid, &q)
-    }
-
-    pub fn show(&self, uid: u32) -> Result<(), HfsError> {
-        let q = self.get_quota(uid)?;
-        let limit_str = if q.limit == 0 {
-            "unlimited".to_string()
-        } else {
-            format!("{} bytes ({:.1} MiB)", q.limit, q.limit as f64 / 1_048_576.0)
-        };
-        println!(
-            "uid={} used={} bytes ({:.1} MiB)  limit={}",
-                 uid,
-                 q.used,
-                 q.used as f64 / 1_048_576.0,
-                 limit_str,
-        );
+        let mut entry = self.load_or_default(uid)?;
+        entry.used         = entry.used.saturating_add(delta);
+        entry.last_updated = Self::timestamp();
+        self.db.insert(Self::entry_key(uid).as_bytes(), bincode::serialize(&entry)?)?;
         Ok(())
+    }
+
+    /// Zwolnij używane miejsce przy kasowaniu pliku (unlink/rmdir).
+    ///
+    /// Ta metoda MUSI być wywoływana z `fs.rs` przy każdym `unlink()` i `rmdir()`.
+    /// Bez tego użycie rośnie bez ograniczeń i generuje fałszywe EDQUOT.
+    pub fn release_usage(&self, uid: u32, bytes: u64) -> Result<(), HfsError> {
+        let mut entry = self.load_or_default(uid)?;
+        entry.used         = entry.used.saturating_sub(bytes);
+        entry.last_updated = Self::timestamp();
+        self.db.insert(Self::entry_key(uid).as_bytes(), bincode::serialize(&entry)?)?;
+        log::debug!("quota: released {}B for uid={} (now used={})", bytes, uid, entry.used);
+        Ok(())
+    }
+
+    pub fn get_usage(&self, uid: u32) -> Result<(u64, u64), HfsError> {
+        let e = self.load_or_default(uid)?;
+        Ok((e.used, e.limit))
+    }
+
+    fn load_or_default(&self, uid: u32) -> Result<QuotaEntry, HfsError> {
+        match self.db.get(Self::entry_key(uid).as_bytes())? {
+            Some(v) => Ok(bincode::deserialize(&v)?),
+            None    => Ok(QuotaEntry { limit: 0, used: 0, last_updated: Self::timestamp() }),
+        }
     }
 }
