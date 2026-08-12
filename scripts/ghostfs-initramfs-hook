@@ -1,173 +1,81 @@
 #!/usr/bin/env bash
-# ghostfs-admin.sh — GhostFS administration helper (cybersec build)
-# Cybersec mode is the only mode — encryption is always on.
+# /etc/initramfs-tools/hooks/ghostfs
+# Initramfs hook — bundles ghostfs binary + libfuse (+ optional TPM/plymouth
+# support) into the initramfs so the root filesystem can be mounted by
+# ghostfs before the init system pivots root.
 #
-# Usage: ghostfs-admin.sh <command> [options]
-# Commands:
-#   keygen   <outfile>                              — generate 256-bit master key
-#   format   <device> [--passphrase]               — format new volume
-#   mount    <device> <mountpoint> <keyfile|--passphrase> [rate_mb]
-#   umount   <mountpoint>                           — unmount
-#   audit    <device> [n=50]                        — show last n audit entries
-#   quota    <device> <uid> [limit_mb]              — show or set quota
-#   forensics-verify <device>                       — verify forensics chain
-#   forensics-tail   <device> [n=100]               — show last n entries
-#   ids      <device> [n=50]                        — show IDS alerts
-#   mac-label   <device> <ino> <level> [comps_hex]  — set MAC label
-#   mac-clear   <device> <uid> <level> [comps_hex] [--trusted]
+# Install:
+#   cp ghostfs-initramfs-hook /etc/initramfs-tools/hooks/ghostfs
+#   chmod +x /etc/initramfs-tools/hooks/ghostfs
+#   update-initramfs -u
+#
+# This hook runs at initramfs BUILD time (not at boot time).
 
-set -euo pipefail
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0;; esac
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
-YELLOW='\033[1;33m'; BOLD='\033[1m'; RESET='\033[0m'
+. /usr/share/initramfs-tools/hook-functions
 
-info() { echo -e "${CYAN}[INFO]${RESET} $*"; }
-ok()   { echo -e "${GREEN}[ OK ]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-die()  { echo -e "${RED}[ERR ]${RESET} $*" >&2; exit 1; }
+# ── Copy the ghostfs binary ──────────────────────────────────────────────────
+GHOSTFS_BIN="$(command -v ghostfs 2>/dev/null || echo /usr/local/bin/ghostfs)"
+if [[ ! -x "$GHOSTFS_BIN" ]]; then
+    echo "ghostfs initramfs hook: binary not found at $GHOSTFS_BIN — skipping" >&2
+    exit 0
+fi
 
-GHOSTFS="${GHOSTFS_BIN:-ghostfs}"
-command -v "$GHOSTFS" &>/dev/null || die "ghostfs binary not found. Set GHOSTFS_BIN or install to PATH."
+copy_exec "$GHOSTFS_BIN" /usr/local/bin/ghostfs
 
-cmd="${1:-help}"; shift || true
+# ── Copy FUSE libraries ──────────────────────────────────────────────────────
+for lib in libfuse3.so.3 libfuse.so.2; do
+    found=$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1==l{print $NF; exit}')
+    [[ -n "$found" ]] && copy_exec "$found"
+done
 
-case "$cmd" in
+# ── Copy TPM 2.0 userspace libraries (only if the 'tpm' feature was built in
+#    and /dev/tpm* is present at build time — best-effort, non-fatal). ───────
+if [[ -e /dev/tpmrm0 || -e /dev/tpm0 ]]; then
+    for lib in libtss2-esys.so.0 libtss2-mu.so.0 libtss2-sys.so.1 libtss2-tctildr.so.0; do
+        found=$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1==l{print $NF; exit}')
+        [[ -n "$found" ]] && copy_exec "$found"
+    done
+    echo "ghostfs initramfs hook: TPM device present — bundled tss2 libraries"
+fi
 
-keygen)
-    out="${1:?output file required}"; shift
-    [[ -e "$out" ]] && die "$out already exists — refusing to overwrite"
-    "$GHOSTFS" keygen --output "$out"
-    ok "Key written to $out"
-    warn "Keep this file safe. Losing it = losing all data."
-    ;;
+# ── Copy plymouth (if installed) so the passphrase prompt can use the splash
+#    screen instead of a raw console read — purely cosmetic, mount script
+#    falls back to plain `read -s` if plymouth isn't available. ─────────────
+if command -v plymouth >/dev/null 2>&1; then
+    copy_exec "$(command -v plymouth)" /bin/plymouth
+fi
 
-format)
-    dev="${1:?device required}"; shift
-    if [[ "${1:-}" == "--passphrase" ]]; then
-        info "Formatting $dev with Argon2id passphrase KDF..."
-        "$GHOSTFS" mkfs --device "$dev"
-    else
-        key="${1:?key file or --passphrase required}"; shift
-        [[ -r "$key" ]] || die "Key file $key not readable"
-        info "Formatting $dev with key file $key..."
-        "$GHOSTFS" mkfs --device "$dev" --key-out /dev/null
-    fi
-    ok "Formatted $dev"
-    ;;
+# ── Copy the plaintext key file if configured (least-preferred unlock path;
+#    prefer GHOSTFS_SEALED_KEY_FILE / TPM below). ────────────────────────────
+KEY_FILE="${GHOSTFS_KEY_FILE:-/etc/ghostfs/key.hex}"
+if [[ -f "$KEY_FILE" ]]; then
+    mkdir -p "${DESTDIR}/etc/ghostfs"
+    cp "$KEY_FILE" "${DESTDIR}/etc/ghostfs/key.hex"
+    chmod 600 "${DESTDIR}/etc/ghostfs/key.hex"
+    echo "ghostfs initramfs hook: bundled plaintext key file"
+fi
 
-mount)
-    dev="${1:?device required}"; shift
-    mnt="${1:?mountpoint required}"; shift
-    auth="${1:?key file or --passphrase required}"; shift
-    rate="${1:-100}"; shift || true
-    mkdir -p "$mnt"
-    if [[ "$auth" == "--passphrase" ]]; then
-        info "Mounting $dev → $mnt (passphrase, rate=${rate}MiB/s)"
-        "$GHOSTFS" mount --device "$dev" --mountpoint "$mnt" \
-            --compression zstd --noatime --rate-limit-mb "$rate" &
-    else
-        [[ -r "$auth" ]] || die "Key file $auth not readable"
-        info "Mounting $dev → $mnt (key-file, rate=${rate}MiB/s)"
-        "$GHOSTFS" mount --device "$dev" --mountpoint "$mnt" \
-            --key-file "$auth" --compression zstd --noatime \
-            --rate-limit-mb "$rate" &
-    fi
-    sleep 1
-    mount | grep -q ghostfs && ok "Mounted at $mnt" || die "Mount failed"
-    ;;
+# ── Copy the TPM-sealed key blob if configured — this is the recommended
+#    unlock path for early-boot: the blob is useless without the matching
+#    TPM + PCR state, so bundling it into the initramfs is safe (unlike the
+#    plaintext key file above, which grants full access to anyone who reads
+#    the initramfs image). Generate with:
+#        ghostfs tpm-seal-key --key-file key.hex --output sealed.bin --pcr 7
+SEALED_KEY_FILE="${GHOSTFS_SEALED_KEY_FILE:-/etc/ghostfs/sealed.bin}"
+if [[ -f "$SEALED_KEY_FILE" ]]; then
+    mkdir -p "${DESTDIR}/etc/ghostfs"
+    cp "$SEALED_KEY_FILE" "${DESTDIR}/etc/ghostfs/sealed.bin"
+    chmod 600 "${DESTDIR}/etc/ghostfs/sealed.bin"
+    echo "ghostfs initramfs hook: bundled TPM-sealed key blob"
+fi
 
-umount)
-    mnt="${1:?mountpoint required}"; shift
-    info "Unmounting $mnt (keys will be zeroed from memory)..."
-    "$GHOSTFS" umount --mountpoint "$mnt"
-    ok "Unmounted $mnt"
-    ;;
+# ── Ensure the fuse kernel module is included ─────────────────────────────────
+manual_add_modules fuse
+force_load fuse
 
-audit)
-    dev="${1:?device required}"; shift
-    n="${1:-50}"; shift || true
-    info "Last $n audit entries from $dev"
-    "$GHOSTFS" audit --device "$dev" tail --count "$n"
-    ;;
-
-quota)
-    dev="${1:?device required}"; shift
-    uid="${1:?uid required}"; shift
-    limit_mb="${1:-}"; shift || true
-    if [[ -n "$limit_mb" ]]; then
-        limit_bytes=$(( limit_mb * 1048576 ))
-        info "Setting quota for uid $uid to ${limit_mb} MiB"
-        "$GHOSTFS" quota --device "$dev" set --uid "$uid" --limit "$limit_bytes"
-        ok "Quota set"
-    else
-        "$GHOSTFS" quota --device "$dev" show --uid "$uid"
-    fi
-    ;;
-
-forensics-verify)
-    dev="${1:?device required}"; shift
-    info "Verifying forensics chain in $dev ..."
-    "$GHOSTFS" forensics --device "$dev" verify
-    ;;
-
-forensics-tail)
-    dev="${1:?device required}"; shift
-    n="${1:-100}"; shift || true
-    "$GHOSTFS" forensics --device "$dev" tail --count "$n"
-    ;;
-
-ids)
-    dev="${1:?device required}"; shift
-    n="${1:-50}"; shift || true
-    info "Last $n IDS alerts from $dev"
-    "$GHOSTFS" ids --device "$dev" --count "$n"
-    ;;
-
-mac-label)
-    dev="${1:?device required}"; shift
-    ino="${1:?ino required}"; shift
-    level="${1:?level 0..3 required}"; shift
-    comps="${1:-0}"; shift || true
-    info "Setting MAC label ino=$ino level=$level compartments=$comps"
-    "$GHOSTFS" mac --device "$dev" set-label \
-        --ino "$ino" --level "$level" --compartments "$comps"
-    ok "Label set"
-    ;;
-
-mac-clear)
-    dev="${1:?device required}"; shift
-    uid="${1:?uid required}"; shift
-    level="${1:?level 0..3 required}"; shift
-    comps="${1:-18446744073709551615}"; shift || true
-    trusted=false
-    [[ "${1:-}" == "--trusted" ]] && trusted=true && shift || true
-    info "Setting clearance uid=$uid level=$level trusted=$trusted"
-    trusted_flag=""
-    [[ "$trusted" == "true" ]] && trusted_flag="--trusted"
-    "$GHOSTFS" mac --device "$dev" set-clearance \
-        --uid "$uid" --level "$level" --compartments "$comps" $trusted_flag
-    ok "Clearance set"
-    ;;
-
-help|--help|-h)
-    echo -e "${BOLD}ghostfs-admin.sh${RESET} — GhostFS (cybersec) administration helper"
-    echo ""
-    echo "  keygen   <outfile>"
-    echo "  format   <device> [--passphrase | <keyfile>]"
-    echo "  mount    <device> <mountpoint> <keyfile|--passphrase> [rate_MiB=100]"
-    echo "  umount   <mountpoint>"
-    echo "  audit    <device> [n=50]"
-    echo "  quota    <device> <uid> [limit_MiB]"
-    echo "  forensics-verify <device>"
-    echo "  forensics-tail   <device> [n=100]"
-    echo "  ids      <device> [n=50]"
-    echo "  mac-label   <device> <ino> <level> [compartments_hex]"
-    echo "  mac-clear   <device> <uid> <level> [compartments_hex] [--trusted]"
-    echo ""
-    echo "  Set GHOSTFS_BIN to override binary path."
-    ;;
-
-*)
-    die "Unknown command '$cmd'. Run 'ghostfs-admin.sh help'."
-    ;;
-esac
+# ── Ensure the tpm kernel modules are included (harmless if unused) ──────────
+manual_add_modules tpm tpm_tis tpm_crb 2>/dev/null || true
