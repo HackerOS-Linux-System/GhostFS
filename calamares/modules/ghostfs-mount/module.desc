@@ -1,0 +1,7 @@
+---
+type:         "job"
+name:         "ghostfs-mount"
+interface:    "python"
+script:       "ghostfs_mount.py"
+noconfig:     true
+weight:       10
