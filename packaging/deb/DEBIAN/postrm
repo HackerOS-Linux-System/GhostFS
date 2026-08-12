@@ -1,0 +1,25 @@
+#!/bin/sh
+# postrm for ghostfs
+set -e
+
+case "$1" in
+  purge|remove)
+    if [ -f /usr/lib/ghostfs/calamares-patch.py ]; then
+        python3 /usr/lib/ghostfs/calamares-patch.py revert || \
+            echo "ghostfs: WARNING failed to revert calamares config patch — check /etc/calamares/*.ghostfs-orig manually" >&2
+    fi
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u || true
+    fi
+    ;;
+
+  upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+  *)
+    echo "postrm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
