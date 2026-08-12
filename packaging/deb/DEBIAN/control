@@ -1,0 +1,28 @@
+Package: ghostfs
+Version: 0.3.0
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: HackerOS Project <packaging@hackeros.local>
+Depends: libfuse3-3 (>= 3.10), calamares (>= 3.2), python3, initramfs-tools | dracut
+Recommends: tpm2-tools
+Conflicts: ghostfs-nocalamares
+Description: GhostFS filesystem + Calamares default-installer integration
+ GhostFS is a cybersecurity-oriented FUSE filesystem (MAC labels, forensics
+ chain-of-custody logging, IDS, canary files, mandatory-by-default
+ encryption in cybersec builds).
+ .
+ This package installs BOTH:
+   1. The ghostfs / ghostfs-cybersec binaries, admin tooling, and
+      initramfs early-boot mount hooks.
+   2. Calamares job modules (ghostfs-mkfs / ghostfs-mount / ghostfs-umount)
+      AND a patch applied to the already-installed Calamares configuration
+      (/etc/calamares/modules/partition.conf and /etc/calamares/settings.conf)
+      that makes GhostFS the ONLY filesystem the installer offers — no
+      ext4, no btrfs, no xfs. Installing this package turns any
+      Calamares-based installer image into a GhostFS-only installer.
+ .
+ This package assumes Calamares is ALREADY installed on the system (see
+ Depends). It does not install or configure Calamares itself beyond the
+ targeted config patch described above, and it reverts that patch cleanly
+ on removal (see DEBIAN/postrm).
