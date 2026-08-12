@@ -1,0 +1,7 @@
+---
+type:         "job"
+name:         "ghostfs-mkfs"
+interface:    "python"
+script:       "ghostfs_mkfs.py"
+noconfig:     false
+weight:       10
