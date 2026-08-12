@@ -1,0 +1,34 @@
+# Fragment merged into /etc/calamares/modules/partition.conf by
+# packaging/deb/usr/lib/ghostfs/calamares-patch.py at package install time.
+#
+# Calamares' `partition` module normally lets the user pick ext4/btrfs/xfs/…
+# for each partition. HackerOS doesn't want that choice — GhostFS is the
+# filesystem, full stop — so we:
+#
+#   1. Restrict `availableFileSystemTypes` to just "ghostfs" (Calamares'
+#      partition page reads this list to populate the filesystem dropdown;
+#      with one entry it's effectively fixed and pre-selected).
+#   2. Set `defaultFileSystemType: ghostfs` as a defensive fallback for any
+#      code path that doesn't consult the restricted list (e.g. "erase disk"
+#      quick-install flows that skip the manual partition page entirely).
+#   3. Actual `mkfs.ghostfs` is never called by the partition module itself
+#      — Calamares' partition module intentionally does NOT format the root
+#      partition when a non-native filesystem is selected; formatting is
+#      deferred to our own `ghostfs-mkfs` job later in the sequence (see
+#      settings.conf.ghostfs). This mirrors how Calamares handles other
+#      out-of-tree/FUSE filesystems (e.g. ZFS on some distros).
+#
+# NOTE: exact key names (`availableFileSystemTypes` / `defaultFileSystemType`)
+# match Calamares >= 3.2's partition module schema at the time this was
+# written; verify against the `partition` module's own default config
+# shipped by your Calamares package if you're on a very different version,
+# and adjust calamares-patch.py's PARTITION_PATCH dict accordingly.
+
+availableFileSystemTypes:
+  - ghostfs
+
+defaultFileSystemType: ghostfs
+
+# Don't let the "erase disk" quick-install path silently pick something else.
+alwaysShowPartitionLabels: true
+enableLuksAutomatedPartitioning: false
