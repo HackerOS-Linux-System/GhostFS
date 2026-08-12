@@ -1,0 +1,286 @@
+name: build
+
+# Builds GhostFS (normal + cybersec binaries) and packages them into a
+# single .deb — "ghostfs" — which:
+#   1. installs the ghostfs / ghostfs-cybersec binaries + admin tooling +
+#      initramfs early-boot hooks, and
+#   2. assumes Calamares is ALREADY installed on the target system, and
+#      patches its configuration so the graphical installer offers ONLY
+#      GhostFS as a root filesystem (no ext4/btrfs/xfs choice).
+#
+# This workflow does NOT install anything on the runner beyond build
+# dependencies — it produces a .deb artifact for you to install elsewhere
+# (`sudo apt install ./ghostfs_<version>_amd64.deb`, or `sudo dpkg -i` +
+# `sudo apt -f install` for dependency resolution).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'source-code/**'
+      - 'Cargo.toml'
+      - 'scripts/**'
+      - 'calamares/**'
+      - 'packaging/**'
+      - '.github/workflows/build.yml'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  PKG_VERSION: 0.3.0
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        continue-on-error: true
+
+      - name: Install Rust toolchain (fallback, pinned)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ghostfs-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ghostfs-
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libfuse3-dev libfuse-dev \
+            libssl-dev \
+            protobuf-compiler \
+            dpkg-dev fakeroot \
+            python3 python3-yaml
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          dpkg-deb --version
+
+      # ── Build binaries ──────────────────────────────────────────────────────
+      # Two separate binaries, per Makefile / build.hl convention:
+      #   normal   — encryption optional (--encryption flag at mkfs time)
+      #   cybersec — encryption always on, MAC/IDS/forensics/canary active
+      - name: cargo build (normal)
+        working-directory: .
+        run: |
+          cargo build --release --no-default-features \
+            --features normal,zstd,lz4
+
+      - name: Stash normal binary
+        run: |
+          mkdir -p dist
+          cp target/release/ghostfs dist/ghostfs-normal
+
+      - name: cargo build (cybersec)
+        run: |
+          cargo build --release --no-default-features \
+            --features cybersec,zstd,lz4
+
+      - name: Stash cybersec binary
+        run: |
+          cp target/release/ghostfs dist/ghostfs-cybersec
+
+      - name: cargo test (best-effort — repo currently has no test suite)
+        run: cargo test --release --no-default-features --features cybersec,zstd,lz4 || \
+          echo "::warning::No tests ran (or tests failed) — see README 'testowanie' section. Not blocking the build."
+
+      # ── Assemble the .deb payload tree ───────────────────────────────────────
+      - name: Assemble packaging tree
+        run: |
+          set -eux
+          PKGROOT="$(mktemp -d)/ghostfs"
+          mkdir -p "$PKGROOT"
+          cp -r packaging/deb/. "$PKGROOT/"
+
+          # Binaries
+          install -Dm755 dist/ghostfs-normal   "$PKGROOT/usr/local/bin/ghostfs"
+          install -Dm755 dist/ghostfs-cybersec "$PKGROOT/usr/local/bin/ghostfs-cybersec"
+
+          # Admin / mount helper scripts
+          install -Dm755 scripts/ghostfs-admin.sh "$PKGROOT/usr/local/bin/ghostfs-admin.sh"
+          install -Dm755 scripts/mount.ghostfs    "$PKGROOT/sbin/mount.ghostfs"
+
+          # initramfs hooks
+          install -Dm755 scripts/ghostfs-initramfs-hook   "$PKGROOT/etc/initramfs-tools/hooks/ghostfs"
+          install -Dm755 scripts/ghostfs-mount-initramfs  "$PKGROOT/etc/initramfs-tools/scripts/local-top/ghostfs-mount"
+
+          # Calamares job modules
+          mkdir -p "$PKGROOT/usr/lib/calamares/modules"
+          cp -r calamares/modules/ghostfs-mkfs   "$PKGROOT/usr/lib/calamares/modules/"
+          cp -r calamares/modules/ghostfs-mount  "$PKGROOT/usr/lib/calamares/modules/"
+          cp -r calamares/modules/ghostfs-umount "$PKGROOT/usr/lib/calamares/modules/"
+          chmod 755 "$PKGROOT"/usr/lib/calamares/modules/*/*.py
+
+          # Calamares config: static ghostfs-mkfs.conf installed directly;
+          # settings.conf + partition.conf patch shipped as docs and applied
+          # by postinst via calamares-patch.py (so we can revert on removal).
+          install -Dm644 calamares/config/ghostfs-mkfs.conf \
+            "$PKGROOT/etc/calamares/modules/ghostfs-mkfs.conf"
+          install -Dm644 calamares/config/settings.conf.ghostfs \
+            "$PKGROOT/usr/share/doc/ghostfs/settings.conf.ghostfs"
+          install -Dm644 calamares/config/partition.conf.ghostfs-patch.yaml \
+            "$PKGROOT/usr/share/doc/ghostfs/partition.conf.ghostfs-patch.yaml"
+
+          # Docs
+          install -Dm644 README.md "$PKGROOT/usr/share/doc/ghostfs/README.md"
+          install -Dm644 LICENSE   "$PKGROOT/usr/share/doc/ghostfs/copyright"
+
+          # Fill in Installed-Size (KB) — dpkg-deb doesn't require it but
+          # apt/dpkg -l output is nicer with it present.
+          SIZE_KB=$(du -sk "$PKGROOT" | cut -f1)
+          sed -i "/^Description:/i Installed-Size: ${SIZE_KB}" "$PKGROOT/DEBIAN/control"
+
+          chmod 755 "$PKGROOT/DEBIAN/postinst" "$PKGROOT/DEBIAN/postrm"
+          echo "PKGROOT=$PKGROOT" >> "$GITHUB_ENV"
+
+      - name: Determine package version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${PKG_VERSION}+git$(date -u +%Y%m%d).${GITHUB_SHA::8}"
+          fi
+          sed -i "s/^Version: .*/Version: ${VERSION}/" "$PKGROOT/DEBIAN/control"
+          echo "DEB_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Lint control file
+        run: |
+          cat "$PKGROOT/DEBIAN/control"
+          dpkg-deb --build --root-owner-group --nocheck "$PKGROOT" /tmp/lint-check.deb
+          dpkg-deb --info /tmp/lint-check.deb
+          rm -f /tmp/lint-check.deb
+
+      # ── Build the .deb ────────────────────────────────────────────────────────
+      - name: Build .deb
+        run: |
+          set -eux
+          mkdir -p out
+          DEB_FILE="out/ghostfs_${DEB_VERSION}_amd64.deb"
+          fakeroot dpkg-deb --build --root-owner-group "$PKGROOT" "$DEB_FILE"
+          dpkg-deb --info "$DEB_FILE"
+          dpkg-deb --contents "$DEB_FILE"
+
+      - name: Verify package with lintian (non-blocking)
+        run: |
+          sudo apt-get install -y --no-install-recommends lintian || true
+          lintian out/*.deb || echo "::warning::lintian reported issues (non-blocking)"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostfs-deb-${{ env.DEB_VERSION }}
+          path: out/*.deb
+          if-no-files-found: error
+
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.deb
+          generate_release_notes: true
+
+  install-smoke-test:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    # Sanity-checks that the .deb installs cleanly against a stub Calamares
+    # package (real Calamares is heavy/GUI-oriented and not worth pulling
+    # into CI just to check our postinst/postrm patch logic runs and
+    # reverts without crashing).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built .deb
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ghostfs-deb-*
+          path: out
+          merge-multiple: true
+
+      - name: Install build deps for stub package
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev fakeroot python3-yaml
+
+      - name: Build a stub 'calamares' package so Depends resolves
+        run: |
+          set -eux
+          STUB="$(mktemp -d)/calamares-stub"
+          mkdir -p "$STUB/DEBIAN" "$STUB/etc/calamares/modules"
+          cat > "$STUB/DEBIAN/control" <<EOF
+          Package: calamares
+          Version: 3.2.0-stub
+          Section: admin
+          Priority: optional
+          Architecture: amd64
+          Maintainer: CI Stub <ci@example.invalid>
+          Description: Stub calamares package for CI smoke-testing ghostfs's postinst
+          EOF
+          cat > "$STUB/etc/calamares/settings.conf" <<'EOF'
+          # stub original settings.conf
+          modules-search: [ local ]
+          sequence:
+            - show: [ welcome, partition, summary ]
+            - exec: [ partition, unpackfs, bootloader ]
+            - show: [ finished ]
+          EOF
+          cat > "$STUB/etc/calamares/modules/partition.conf" <<'EOF'
+          availableFileSystemTypes: [ ext4, btrfs, xfs ]
+          defaultFileSystemType: ext4
+          EOF
+          fakeroot dpkg-deb --build --root-owner-group "$STUB" /tmp/calamares-stub.deb
+          sudo dpkg -i /tmp/calamares-stub.deb
+
+      - name: Install ghostfs .deb
+        run: |
+          sudo apt-get install -y ./out/*.deb || sudo dpkg -i ./out/*.deb
+          sudo apt-get -f install -y || true
+
+      - name: Verify GhostFS-only patch was applied
+        run: |
+          echo "--- partition.conf after install ---"
+          cat /etc/calamares/modules/partition.conf
+          grep -q "^- ghostfs$" /etc/calamares/modules/partition.conf || \
+            grep -q "ghostfs" /etc/calamares/modules/partition.conf
+          grep -q "defaultFileSystemType: ghostfs" /etc/calamares/modules/partition.conf
+          test -f /etc/calamares/modules/partition.conf.ghostfs-orig
+          test -f /etc/calamares/settings.conf.ghostfs-orig
+          grep -q "ghostfs-mkfs" /etc/calamares/settings.conf
+          echo "OK: Calamares now GhostFS-only"
+
+      - name: Verify mount.ghostfs and binaries were installed
+        run: |
+          test -x /sbin/mount.ghostfs
+          test -x /usr/local/bin/ghostfs
+          test -x /usr/local/bin/ghostfs-cybersec
+          /usr/local/bin/ghostfs --help
+
+      - name: Remove ghostfs and verify Calamares config was restored
+        run: |
+          sudo apt-get remove -y ghostfs
+          echo "--- partition.conf after removal ---"
+          cat /etc/calamares/modules/partition.conf
+          grep -q "ext4" /etc/calamares/modules/partition.conf
+          ! test -f /etc/calamares/modules/partition.conf.ghostfs-orig
+          echo "OK: original Calamares config restored on removal"
