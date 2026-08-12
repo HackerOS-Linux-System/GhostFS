@@ -1,0 +1,3 @@
+/etc/calamares/modules/ghostfs-mkfs.conf
+/etc/initramfs-tools/hooks/ghostfs
+/etc/initramfs-tools/scripts/local-top/ghostfs-mount
