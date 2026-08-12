@@ -1,0 +1,7 @@
+---
+type:         "job"
+name:         "ghostfs-umount"
+interface:    "python"
+script:       "ghostfs_umount.py"
+noconfig:     true
+weight:       10
