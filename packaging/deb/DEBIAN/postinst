@@ -1,0 +1,53 @@
+#!/bin/sh
+# postinst for ghostfs
+set -e
+
+case "$1" in
+  configure)
+    echo "ghostfs: configuring..."
+
+    # ── Permissions ──────────────────────────────────────────────────────────
+    chmod 0755 /usr/local/bin/ghostfs            2>/dev/null || true
+    chmod 0755 /usr/local/bin/ghostfs-cybersec   2>/dev/null || true
+    chmod 0755 /usr/local/bin/ghostfs-admin.sh   2>/dev/null || true
+    chmod 0755 /sbin/mount.ghostfs               2>/dev/null || true
+    chmod 0755 /etc/initramfs-tools/hooks/ghostfs                     2>/dev/null || true
+    chmod 0755 /etc/initramfs-tools/scripts/local-top/ghostfs-mount   2>/dev/null || true
+    chmod 0700 /etc/ghostfs 2>/dev/null || mkdir -p -m 0700 /etc/ghostfs
+
+    # ── Register /sbin/mount.ghostfs with the system so plain
+    #    `mount -t ghostfs` / fstab entries work outside Calamares too. ───────
+    if [ ! -e /sbin/mount.ghostfs ]; then
+        echo "ghostfs: WARNING mount.ghostfs helper missing from package — 'mount -t ghostfs' won't work" >&2
+    fi
+
+    # ── Calamares integration ────────────────────────────────────────────────
+    if dpkg -s calamares >/dev/null 2>&1; then
+        python3 /usr/lib/ghostfs/calamares-patch.py apply || \
+            echo "ghostfs: WARNING calamares-patch.py apply failed — installer will still offer ext4/btrfs. See /usr/share/doc/ghostfs/README-calamares.md" >&2
+    else
+        echo "ghostfs: WARNING calamares not detected via dpkg even though it's a Depends — skipping installer patch." >&2
+    fi
+
+    # ── initramfs ─────────────────────────────────────────────────────────────
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u || echo "ghostfs: WARNING update-initramfs failed — run it manually before rebooting into a ghostfs root" >&2
+    fi
+
+    echo "ghostfs: done."
+    echo "ghostfs: to make GhostFS the LIVE root filesystem, see /usr/share/doc/ghostfs/README-calamares.md"
+    echo "ghostfs: for existing systems, mount a GhostFS volume manually with:"
+    echo "  ghostfs-admin.sh format /path/to/device --passphrase"
+    echo "  ghostfs-admin.sh mount  /path/to/device /mnt/point --passphrase"
+    ;;
+
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+  *)
+    echo "postinst called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
