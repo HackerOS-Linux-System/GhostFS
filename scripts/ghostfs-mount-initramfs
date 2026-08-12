@@ -1,45 +1,223 @@
 #!/usr/bin/env bash
-# /etc/initramfs-tools/hooks/ghostfs
-# Initramfs hook — bundles ghostfs binary + libfuse into the initramfs so the
-# root filesystem can be mounted by ghostfs before the init system pivots root.
+# /etc/initramfs-tools/scripts/local-top/ghostfs-mount
+# Initramfs BOOT script — mounts the GhostFS root partition before
+# pivot_root hands control to the init system.
 #
 # Install:
-#   cp ghostfs-initramfs-hook /etc/initramfs-tools/hooks/ghostfs
-#   chmod +x /etc/initramfs-tools/hooks/ghostfs
+#   cp ghostfs-mount-initramfs /etc/initramfs-tools/scripts/local-top/ghostfs-mount
+#   chmod +x /etc/initramfs-tools/scripts/local-top/ghostfs-mount
 #   update-initramfs -u
 #
-# This hook runs at initramfs BUILD time (not at boot time).
+# ── Unlock priority (v0.3+) ──────────────────────────────────────────────────
+#   1. TPM early-boot unlock  — if ghostfs.tpm=1 and a sealed key blob is
+#      present, unseal it against the configured PCR with no user interaction.
+#      Skipped entirely if ghostfs.recovery=1 (forces step 2), or if the TPM
+#      state doesn't match (PCR mismatch -> boot chain changed since sealing).
+#   2. Interactive passphrase — prompted at the console (via plymouth if the
+#      splash is active, otherwise a plain `read -s`), up to
+#      GHOSTFS_MAX_ATTEMPTS tries.
+#   3. Recovery shell — if both above fail (or ghostfs.recovery=1 was set and
+#      the user cancels), drop to a minimal `/bin/sh` inside the initramfs so
+#      the machine isn't just a dead black screen. Mirrors the standard
+#      cryptsetup/LUKS "type your passphrase, or press Ctrl-D for a shell"
+#      recovery UX that sysadmins already expect.
+#
+# Kernel command-line parameters consumed:
+#   ghostfs.device=<path>         — block device or image (required)
+#   ghostfs.cybersec=1            — enable cybersec mode (encryption enforced)
+#   ghostfs.keyfile=<path>        — plaintext key file inside initramfs (least
+#                                    preferred — prefer sealed_keyfile or a
+#                                    typed passphrase)
+#   ghostfs.sealed_keyfile=<path> — TPM-sealed key blob (see `ghostfs tpm-seal-key`)
+#   ghostfs.tpm=1                 — attempt TPM early-boot unlock first
+#   ghostfs.tpm_pcr=<n>           — PCR index the key was sealed against (default 7)
+#   ghostfs.recovery=1            — skip TPM unlock, go straight to passphrase
+#                                    prompt (use after a BIOS/kernel update that
+#                                    invalidated the sealed PCR value)
+#   ghostfs.compression=<algo>    — zstd (default) | lz4 | zlib | none
+#   ghostfs.noatime=1             — enable noatime (default: 1)
 
-PREREQ=""
+PREREQ="udev"
 prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0;; esac
 
-. /usr/share/initramfs-tools/hook-functions
+. /scripts/functions
 
-# ── Copy the ghostfs binary ──────────────────────────────────────────────────
-GHOSTFS_BIN="$(command -v ghostfs 2>/dev/null || echo /usr/local/bin/ghostfs)"
-if [[ ! -x "$GHOSTFS_BIN" ]]; then
-    echo "ghostfs initramfs hook: binary not found at $GHOSTFS_BIN — skipping" >&2
+GHOSTFS_MAX_ATTEMPTS=3
+
+# ── Parse kernel command line ────────────────────────────────────────────────
+GHOSTFS_DEVICE=""
+GHOSTFS_CYBERSEC=0
+GHOSTFS_KEYFILE="/etc/ghostfs/key.hex"
+GHOSTFS_SEALED_KEYFILE="/etc/ghostfs/sealed.bin"
+GHOSTFS_TPM=0
+GHOSTFS_TPM_PCR=7
+GHOSTFS_RECOVERY=0
+GHOSTFS_COMPRESSION="zstd"
+GHOSTFS_NOATIME=1
+
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        ghostfs.device=*)         GHOSTFS_DEVICE="${param#ghostfs.device=}" ;;
+        ghostfs.cybersec=*)       GHOSTFS_CYBERSEC="${param#ghostfs.cybersec=}" ;;
+        ghostfs.keyfile=*)        GHOSTFS_KEYFILE="${param#ghostfs.keyfile=}" ;;
+        ghostfs.sealed_keyfile=*) GHOSTFS_SEALED_KEYFILE="${param#ghostfs.sealed_keyfile=}" ;;
+        ghostfs.tpm=*)            GHOSTFS_TPM="${param#ghostfs.tpm=}" ;;
+        ghostfs.tpm_pcr=*)        GHOSTFS_TPM_PCR="${param#ghostfs.tpm_pcr=}" ;;
+        ghostfs.recovery=*)       GHOSTFS_RECOVERY="${param#ghostfs.recovery=}" ;;
+        ghostfs.compression=*)    GHOSTFS_COMPRESSION="${param#ghostfs.compression=}" ;;
+        ghostfs.noatime=*)        GHOSTFS_NOATIME="${param#ghostfs.noatime=}" ;;
+    esac
+done
+
+if [[ -z "$GHOSTFS_DEVICE" ]]; then
+    # Not a GhostFS boot — exit silently
     exit 0
 fi
 
-copy_exec "$GHOSTFS_BIN" /usr/local/bin/ghostfs
+log_begin_msg "GhostFS: mounting root from $GHOSTFS_DEVICE"
 
-# ── Copy FUSE libraries ──────────────────────────────────────────────────────
-for lib in libfuse3.so.3 libfuse.so.2; do
-    found=$(ldconfig -p 2>/dev/null | awk -v l="$lib" '$1==l{print $NF; exit}')
-    [[ -n "$found" ]] && copy_exec "$found"
+# ── Recovery shell helper ──────────────────────────────────────────────────────
+# Drops the user into a minimal shell inside the initramfs. Mirrors the
+# standard cryptsetup/dracut behaviour: don't just hang or reboot-loop when
+# unlock fails, give the operator a way to inspect /dev, retry manually, or
+# fsck the underlying block device.
+ghostfs_recovery_shell() {
+    local reason="$1"
+    log_failure_msg "GhostFS: entering recovery shell — $reason"
+    echo ""
+    echo "==================================================================="
+    echo " GhostFS could not unlock/mount the root volume automatically."
+    echo " Reason: $reason"
+    echo ""
+    echo " You are in a minimal initramfs shell. Useful commands:"
+    echo "   ghostfs mount --device $GHOSTFS_DEVICE --mountpoint \${rootmnt} \\"
+    echo "                 --passphrase   (will prompt)"
+    echo "   exit                          # resume normal boot script (retries)"
+    echo "==================================================================="
+    echo ""
+    # panic() is the standard initramfs-tools helper — drops to /bin/sh and,
+    # on shell exit, returns control here so boot can continue/retry.
+    panic "GhostFS: dropping to recovery shell ($reason)"
+}
+
+# ── Load FUSE ─────────────────────────────────────────────────────────────────
+modprobe fuse 2>/dev/null || true
+[[ -e /dev/fuse ]] || mknod /dev/fuse c 10 229
+
+# ── Wait for device ───────────────────────────────────────────────────────────
+for i in $(seq 1 20); do
+    [[ -e "$GHOSTFS_DEVICE" ]] && break
+    sleep 0.5
 done
-
-# ── Copy the key file if configured ─────────────────────────────────────────
-KEY_FILE="${GHOSTFS_KEY_FILE:-/etc/ghostfs/key.hex}"
-if [[ -f "$KEY_FILE" ]]; then
-    mkdir -p "${DESTDIR}/etc/ghostfs"
-    cp "$KEY_FILE" "${DESTDIR}/etc/ghostfs/key.hex"
-    chmod 600 "${DESTDIR}/etc/ghostfs/key.hex"
-    echo "ghostfs initramfs hook: bundled key file"
+if [[ ! -e "$GHOSTFS_DEVICE" ]]; then
+    ghostfs_recovery_shell "device $GHOSTFS_DEVICE never appeared"
+    exit 1
 fi
 
-# ── Ensure the fuse kernel module is included ─────────────────────────────────
-manual_add_modules fuse
-force_load fuse
+# ── Attempt 1: TPM early-boot unlock (no user interaction) ────────────────────
+KEY_ARGS=()
+UNLOCKED=0
+
+if [[ "$GHOSTFS_TPM" == "1" && "$GHOSTFS_RECOVERY" != "1" ]]; then
+    if [[ -f "$GHOSTFS_SEALED_KEYFILE" ]]; then
+        log_begin_msg "GhostFS: attempting TPM unlock (PCR $GHOSTFS_TPM_PCR)"
+        KEY_ARGS=(--sealed-key-file "$GHOSTFS_SEALED_KEYFILE" --tpm-pcr "$GHOSTFS_TPM_PCR")
+        UNLOCKED=1
+        log_end_msg 0
+    else
+        log_failure_msg "GhostFS: ghostfs.tpm=1 but $GHOSTFS_SEALED_KEYFILE missing — falling back to passphrase"
+    fi
+fi
+
+# ── Attempt 2: plaintext keyfile bundled in initramfs (least preferred) ───────
+if [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" == "1" && "$GHOSTFS_RECOVERY" != "1" && -f "$GHOSTFS_KEYFILE" ]]; then
+    KEY_ARGS=(--key-file "$GHOSTFS_KEYFILE")
+    UNLOCKED=1
+fi
+
+# ── Attempt 3: interactive passphrase (console or plymouth splash) ────────────
+prompt_passphrase() {
+    local attempt="$1"
+    if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+        plymouth ask-for-password \
+            --prompt "GhostFS passphrase (attempt ${attempt}/${GHOSTFS_MAX_ATTEMPTS})"
+    else
+        # Plain console fallback — no splash active.
+        echo -n "GhostFS passphrase (attempt ${attempt}/${GHOSTFS_MAX_ATTEMPTS}): " > /dev/console
+        local pass
+        read -rs pass < /dev/console
+        echo "" > /dev/console
+        echo "$pass"
+    fi
+}
+
+if [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" == "1" ]]; then
+    for attempt in $(seq 1 "$GHOSTFS_MAX_ATTEMPTS"); do
+        pass="$(prompt_passphrase "$attempt")"
+        [[ -z "$pass" ]] && continue
+        KEY_ARGS=(--passphrase "$pass")
+        UNLOCKED=1
+        # We can't cheaply verify the passphrase before a real mount attempt
+        # (that requires reading+HMAC-checking the superblock), so we just
+        # try the mount below; if it fails we loop back here.
+        break
+    done
+    if [[ "$UNLOCKED" == "0" ]]; then
+        ghostfs_recovery_shell "no passphrase entered after $GHOSTFS_MAX_ATTEMPTS attempts"
+    fi
+elif [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" != "1" ]]; then
+    # Normal (non-cybersec) mode — encryption optional, no key needed.
+    UNLOCKED=1
+fi
+
+# ── Build mount arguments ─────────────────────────────────────────────────────
+ARGS=(mount --device "$GHOSTFS_DEVICE" --mountpoint "${rootmnt}" \
+      --compression "$GHOSTFS_COMPRESSION")
+[[ "$GHOSTFS_NOATIME" == "1" ]] && ARGS+=(--noatime)
+ARGS+=("${KEY_ARGS[@]}")
+
+# ── Mount (with retry-on-wrong-passphrase loop) ────────────────────────────────
+mount_attempt=0
+MOUNT_OK=0
+while [[ $mount_attempt -lt $GHOSTFS_MAX_ATTEMPTS ]]; do
+    mount_attempt=$((mount_attempt + 1))
+
+    /usr/local/bin/ghostfs "${ARGS[@]}" &
+    GPID=$!
+
+    ok=0
+    for i in $(seq 1 20); do
+        if mount | grep -q "${rootmnt}"; then ok=1; break; fi
+        # Process died early (e.g. wrong passphrase -> HMAC verify failed)?
+        kill -0 "$GPID" 2>/dev/null || break
+        sleep 0.5
+    done
+
+    if [[ "$ok" == "1" ]]; then
+        MOUNT_OK=1
+        break
+    fi
+
+    kill "$GPID" 2>/dev/null || true
+    log_failure_msg "GhostFS: mount attempt $mount_attempt failed"
+
+    # Only retry the passphrase prompt in cybersec mode with no TPM unlock —
+    # a bad TPM/keyfile unlock won't fix itself by looping.
+    if [[ "$GHOSTFS_CYBERSEC" == "1" && "$GHOSTFS_TPM" != "1" ]]; then
+        pass="$(prompt_passphrase "$((mount_attempt + 1))")"
+        ARGS=(mount --device "$GHOSTFS_DEVICE" --mountpoint "${rootmnt}" \
+              --compression "$GHOSTFS_COMPRESSION")
+        [[ "$GHOSTFS_NOATIME" == "1" ]] && ARGS+=(--noatime)
+        [[ -n "$pass" ]] && ARGS+=(--passphrase "$pass")
+    else
+        break
+    fi
+done
+
+if [[ "$MOUNT_OK" != "1" ]]; then
+    ghostfs_recovery_shell "mount failed after $mount_attempt attempt(s) — wrong passphrase, corrupted superblock, or device I/O error"
+    exit 1
+fi
+
+log_end_msg 0
