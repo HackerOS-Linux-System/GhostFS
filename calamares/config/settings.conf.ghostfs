@@ -1,0 +1,64 @@
+# /etc/calamares/settings.conf — HackerOS / GhostFS edition
+#
+# Installed verbatim by the ghostfs-calamares .deb package (see
+# packaging/deb/DEBIAN/postinst — it backs up any existing settings.conf to
+# settings.conf.ghostfs-orig before replacing it, and restores it on
+# package removal).
+#
+# Deliberately has NO ext4/btrfs/xfs mkfs step anywhere in the sequence —
+# ghostfs-mkfs is the only filesystem job. There is nothing to "choose" on
+# the partitioning page beyond where to put partitions; the filesystem
+# itself is fixed.
+
+modules-search: [ local, /usr/lib/calamares/modules ]
+
+sequence:
+  - show:
+      - welcome
+      - locale
+      - keyboard
+      - partition
+      - users
+      - summary
+
+  - exec:
+      # 1. Standard partition table write (does NOT mkfs — GhostFS handles that)
+      - partition
+
+      # 2. Format root partition with GhostFS (see ghostfs-mkfs.conf)
+      - ghostfs-mkfs
+
+      # 3. Mount GhostFS root so the unpacker can write to it
+      - ghostfs-mount
+
+      # 4. Copy live system into GhostFS
+      - unpackfs
+
+      # 5. Standard post-install modules
+      - machineid
+      - fstab
+      - locale
+      - keyboard
+      - localecfg
+      - users
+      - displaymanager
+      - networkcfg
+      - hwclock
+      - services-systemd
+      - initramfscfg
+      - initramfs          # runs update-initramfs — picks up the ghostfs hook
+      - grubcfg
+      - bootloader
+
+      # 6. Clean unmount
+      - ghostfs-umount
+
+  - show:
+      - finished
+
+branding: hackeros
+prompt-install: true
+dont-chroot: false
+oem-setup: false
+disable-cancel: false
+disable-cancel-during-exec: true
