@@ -46,12 +46,33 @@ tokio-stream = "0.1"
 tss-esapi    = { version = "7.5", optional = true }
 zstd         = { version = "0.13", optional = true }
 lz4          = { version = "1.24", optional = true }
+# Ed25519 signatures for `ghostfs forensics export --signed` — asymmetric
+# so a third party (court, external auditor) can verify chain-of-custody
+# authenticity WITHOUT needing access to the volume's master key. HMAC
+# (used elsewhere in this codebase, e.g. audit.rs/superblock.rs) is
+# intentionally NOT used here: HMAC verification requires the same secret
+# that produced it, which means "verifiable by anyone" and "only the
+# volume holder could have produced it" can't both be true at once — the
+# exact property a legal chain-of-custody signature needs.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
-default = ["zstd", "lz4"]
-zstd    = ["dep:zstd"]
-lz4     = ["dep:lz4"]
-tpm     = ["dep:tss-esapi"]
+default  = ["normal", "zstd", "lz4"]
+zstd     = ["dep:zstd"]
+lz4      = ["dep:lz4"]
+tpm      = ["dep:tss-esapi"]
+# ── Build modes ──────────────────────────────────────────────────────────
+# Marker features (no extra deps) consumed by `Makefile` / CI to select
+# the binary's default behaviour at compile time. Previously referenced
+# by `make normal` / `make cybersec` but not actually declared here —
+# builds using those Makefile targets would fail with "unknown feature".
+normal   = []
+cybersec = []
+# gRPC forensics streaming over TLS (see security/grpc_forensics.rs) —
+# optional because it pulls in rustls/tokio-rustls/rustls-pemfile.
+grpc-tls = []
+# HTTPS canary beacon (see security/canary.rs) — optional, needs reqwest.
+canary-https = []
 
 [build-dependencies]
 tonic-build = "0.11"
