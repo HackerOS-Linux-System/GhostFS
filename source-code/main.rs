@@ -4,10 +4,12 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use fuser::MountOption;
 use hex;
+use bincode;
+use blake3;
 
 use ghostfs::{
     GhostFS,
-    crypto::Key,
+    crypto::{Key, Crypto},
     audit::Audit,
     quota::Quota,
     forensics::Forensics,
@@ -17,6 +19,11 @@ use ghostfs::{
     kdf::{self, KdfParams},
     superblock::Superblock,
     rate_limit::RateLimiter,
+    backup::Backup,
+    compression::{Compression, CompressionType},
+    deduplication::Deduplication,
+    versioning::Versioning,
+    repair::Repair,
 };
 
 #[derive(Parser)]
@@ -32,12 +39,33 @@ enum Commands {
     Mount {
         #[arg(short, long)] device:     PathBuf,
         #[arg(short, long)] mountpoint: PathBuf,
-        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
-        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+        #[arg(long, conflicts_with_all = ["passphrase", "sealed_key_file"])] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["key_file", "sealed_key_file"])]   passphrase: Option<String>,
+        /// TPM-sealed key blob (produced by `ghostfs tpm seal`) — used for
+        /// early-boot unlock from initramfs. Falls back to software
+        /// unseal (NO hardware protection) if no TPM is present; see
+        /// security/tpm.rs. Conflicts with --key-file/--passphrase.
+        #[arg(long, conflicts_with_all = ["key_file", "passphrase"])] sealed_key_file: Option<PathBuf>,
+        /// PCR index the sealed key is bound to (required with --sealed-key-file).
+        #[arg(long, default_value_t = 7)] tpm_pcr: u32,
         #[arg(long)] compression:   Option<String>,
         #[arg(long)] noatime:       bool,
         #[arg(long)] allow_other:   bool,
         #[arg(long, default_value_t = 100)] rate_limit_mb: u64,
+        /// Refuse to mount unless the audit HMAC chain AND forensics
+        /// chain-of-custody log both verify intact. Superblock HMAC is
+        /// ALWAYS checked (fail-closed) regardless of this flag — this
+        /// flag adds the (slower, O(log size)) extra checks on top.
+        #[arg(long)] strict: bool,
+    },
+
+    /// Seal a raw 256-bit key file against the TPM (or software fallback)
+    /// bound to a PCR value — used to enable early-boot unlock without a
+    /// typed passphrase. See `scripts/ghostfs-mount-initramfs`.
+    TpmSealKey {
+        #[arg(long)] key_file: PathBuf,
+        #[arg(long)] output:   PathBuf,
+        #[arg(long, default_value_t = 7)] pcr: u32,
     },
 
     /// Format (initialise) a new GhostFS volume
@@ -73,12 +101,18 @@ enum Commands {
 
     Ids {
         #[arg(short, long)] device: PathBuf,
-        #[arg(short, long, default_value_t = 50)] count: usize,
+        #[command(subcommand)] action: IdsCommands,
     },
 
     Mac {
         #[arg(short, long)] device: PathBuf,
         #[command(subcommand)] action: MacCommands,
+    },
+
+    /// WORM / immutable file protection — see security/worm.rs.
+    Worm {
+        #[arg(short, long)] device: PathBuf,
+        #[command(subcommand)] action: WormCommands,
     },
 
     /// Manage canary (honeypot) files
@@ -88,6 +122,48 @@ enum Commands {
     },
 
     Keygen { #[arg(short, long)] output: PathBuf },
+
+    /// Export a full or incremental encrypted backup of a volume to a single portable file.
+    Backup {
+        #[arg(short, long)] device: PathBuf,
+        #[arg(short, long)] output: PathBuf,
+        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+        /// Osobne hasło do zaszyfrowania SAMEGO pliku backupu (opcjonalne —
+        /// domyślnie używany jest wewnętrzny wrapping_key wolumenu).
+        #[arg(long)] backup_passphrase: Option<String>,
+        /// Backup przyrostowy: tylko inode zmienione po tym seq numerze
+        /// forensics logu (zobacz `ghostfs forensics tail`).
+        #[arg(long)] since_seq: Option<u64>,
+        /// Wymagane przy --since-seq: lista inode do dołączenia (comma-separated).
+        #[arg(long, value_delimiter = ',')] changed_inodes: Vec<u64>,
+    },
+
+    /// Restore an encrypted backup file into a brand-new volume (device must not exist).
+    Restore {
+        #[arg(short, long)] input:  PathBuf,
+        #[arg(short, long)] device: PathBuf,
+        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+        #[arg(long)] backup_passphrase: Option<String>,
+    },
+
+    /// Show metadata about a backup file without restoring it.
+    BackupInfo { #[arg(short, long)] input: PathBuf },
+
+    /// Full offline security self-test: superblock HMAC, audit log HMAC
+    /// chain, forensics chain-of-custody, and a per-block integrity-tree
+    /// scan (blake3 leaves vs stored data, dedup refcounts). Does NOT
+    /// mount the volume — safe to run on a volume that's suspected to be
+    /// compromised/tampered, without giving anything FUSE-level access.
+    Verify {
+        #[arg(short, long)] device: PathBuf,
+        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+        /// Skip the full block-level integrity scan (only checks
+        /// superblock/audit/forensics — much faster on large volumes).
+        #[arg(long)] quick: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,6 +186,25 @@ enum QuotaCommands {
 enum ForensicsCommands {
     Verify,
     Tail { #[arg(short, long, default_value_t = 100)] count: usize },
+    /// Export the full chain-of-custody log to a file, signed with the
+    /// volume's Ed25519 key — verifiable by a third party without any
+    /// access to the volume itself (see `ghostfs forensics signing-key`).
+    Export {
+        #[arg(short, long)] output: PathBuf,
+        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+    },
+    /// Verify a previously exported signed log — needs ONLY the exported
+    /// file itself (public key + signature are embedded in it). Does NOT
+    /// open, mount, or even touch the original volume.
+    VerifyExport { #[arg(short, long)] input: PathBuf },
+    /// Print this volume's Ed25519 public key (hex) — hand this to an
+    /// auditor/court ONCE, ahead of time, out-of-band, so future signed
+    /// exports can be verified as genuinely coming from this volume.
+    SigningKey {
+        #[arg(long, conflicts_with = "passphrase")] key_file:   Option<PathBuf>,
+        #[arg(long, conflicts_with = "key_file")]   passphrase: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +237,33 @@ enum CanaryCommands {
     List,
 }
 
+#[derive(Subcommand)]
+enum WormCommands {
+    /// Set immutable flag (equivalent of `chattr +i`) — root only, and only
+    /// clearable while no active hard retention is set (see `Retain`).
+    Lock   { #[arg(long)] ino: u64 },
+    /// Clear the immutable flag — fails if a retention period is still active.
+    Unlock { #[arg(long)] ino: u64 },
+    /// Set/extend a hard WORM retention (Unix epoch seconds) — can only
+    /// ever be EXTENDED, never shortened, by anyone, including root.
+    Retain { #[arg(long)] ino: u64, #[arg(long)] until: u64 },
+    /// Show current WORM state for an inode.
+    Show   { #[arg(long)] ino: u64 },
+}
+
+#[derive(Subcommand)]
+enum IdsCommands {
+    /// List recent alerts (most recent first).
+    List { #[arg(short, long, default_value_t = 50)] count: usize },
+    /// Lock a UID out completely — same effect as automatic lockout, but
+    /// triggered manually (e.g. after reviewing an alert externally).
+    Lock { #[arg(long)] uid: u32 },
+    /// Clear an automatic (or manual) lockout for a UID.
+    Unlock { #[arg(long)] uid: u32 },
+    /// List currently locked-out UIDs.
+    ListLocked,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
@@ -150,8 +272,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mount { device, mountpoint, key_file, passphrase, compression, noatime, allow_other, rate_limit_mb } => {
-            let key = resolve_key(&device, key_file, passphrase)?;
+        Commands::Mount { device, mountpoint, key_file, passphrase, sealed_key_file, tpm_pcr, compression, noatime, allow_other, rate_limit_mb, strict } => {
+            let key = if let Some(sealed) = sealed_key_file {
+                let blob = std::fs::read(&sealed)
+                    .map_err(|e| format!("Cannot read sealed key blob {}: {}", sealed.display(), e))?;
+                let seal = ghostfs::tpm::TpmSeal::new(tpm_pcr)?;
+                let raw = seal.unseal_key(&blob)
+                    .map_err(|e| format!(
+                        "TPM unseal failed ({e}). This can mean the boot chain changed \
+                         (BIOS/kernel/initramfs update moved PCR {tpm_pcr}) or the TPM is \
+                         unavailable. Boot with 'ghostfs.recovery=1' to fall back to a \
+                         passphrase prompt instead."
+                    ))?;
+                if raw.len() != 32 { return Err("Unsealed key is not 32 bytes — sealed blob corrupted".into()); }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&raw);
+                arr
+            } else {
+                resolve_key(&device, key_file, passphrase)?
+            };
+
+            if strict {
+                println!("→ --strict: verifying audit + forensics chains before mount...");
+                let db = sled::open(&device)?;
+                let mut audit = Audit::new(&db)?;
+                audit.set_signing_key(&key);
+                match audit.verify_signatures() {
+                    Ok(n)  => println!("  ✓ audit log: {} signed blocks intact", n),
+                    Err(e) => return Err(format!("STRICT MOUNT REFUSED — audit log tampered: {}", e).into()),
+                }
+                let forensics = Forensics::new(&db)?;
+                match forensics.verify_chain() {
+                    Ok(n)  => println!("  ✓ forensics chain: {} entries intact", n),
+                    Err(e) => return Err(format!("STRICT MOUNT REFUSED — forensics chain broken: {}", e).into()),
+                }
+                drop(db);
+            }
+
             let mut fs = GhostFS::new(&device, key, compression, noatime)?;
 
             if rate_limit_mb > 0 {
@@ -262,17 +419,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     println!("─ {} entries ─", entries.len());
                 }
+                ForensicsCommands::Export { output, key_file, passphrase } => {
+                    let key    = resolve_key(&device, key_file, passphrase)?;
+                    let sb     = Superblock::load_and_verify(&db, &key)?;
+                    let crypto = Crypto::new_with_uuid(key, sb.data.volume_uuid)?;
+                    let manifest = forensics.export_signed(&output, &crypto)?;
+                    println!("✓ signed export → {} ({} entries)", output.display(), manifest.entry_count);
+                    println!("  public key (share with auditor once, out-of-band): {}", manifest.public_key_hex);
+                }
+                ForensicsCommands::VerifyExport { input } => {
+                    let (manifest, payload) = Forensics::read_signed_export(&input)?;
+                    let ok = ghostfs::signing::verify_signed_export(&manifest, &payload)?;
+                    println!("export:      {}", input.display());
+                    println!("exported_at: {}", manifest.exported_at);
+                    println!("entries:     {}", manifest.entry_count);
+                    println!("public_key:  {}", manifest.public_key_hex);
+                    if ok {
+                        println!("RESULT: ✓ signature valid — export is authentic and unmodified.");
+                    } else {
+                        println!("RESULT: ✗ SIGNATURE INVALID — export is tampered, corrupted, or forged.");
+                        std::process::exit(2);
+                    }
+                }
+                ForensicsCommands::SigningKey { key_file, passphrase } => {
+                    let key    = resolve_key(&device, key_file, passphrase)?;
+                    let sb     = Superblock::load_and_verify(&db, &key)?;
+                    let crypto = Crypto::new_with_uuid(key, sb.data.volume_uuid)?;
+                    let signer = ghostfs::signing::ForensicsSigner::load_or_generate(&db, &crypto)?;
+                    println!("{}", signer.public_key_hex());
+                }
             }
         }
 
-        Commands::Ids { device, count } => {
-            let db     = sled::open(&device)?;
-            let ids    = Ids::new(&db)?;
-            let alerts = ids.recent_alerts(count)?;
-            for a in &alerts {
-                println!("[ts={:>12}] uid={:<6} kind={:?}  detail={}", a.timestamp, a.uid, a.kind, a.detail);
+        Commands::Ids { device, action } => {
+            let db = sled::open(&device)?;
+            let ids = Ids::new(&db)?;
+            let rate_limit = RateLimiter::new();
+            let auto_response = ghostfs::response::AutoResponse::new(&db)?;
+
+            match action {
+                IdsCommands::List { count } => {
+                    let alerts = ids.get_alerts(count)?;
+                    for a in &alerts {
+                        println!("[ts={:>12}] uid={:<6} ino={:<8} mask={:<3} reason={}",
+                            a.timestamp, a.uid, a.ino, a.access_mask, a.reason);
+                    }
+                    println!("─ {} alerts ─", alerts.len());
+                }
+                IdsCommands::Lock { uid } => {
+                    // Reuse AutoResponse's persistence so it survives remounts
+                    // and is picked up consistently by GhostFS::new().
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                    db.insert(format!("ids:lockout:{}", uid).as_bytes(), bincode::serialize(&now)?)?;
+                    println!("✓ uid={} locked out (manual)", uid);
+                }
+                IdsCommands::Unlock { uid } => {
+                    auto_response.unlock_uid(&rate_limit, uid)?;
+                    println!("✓ uid={} unlocked", uid);
+                }
+                IdsCommands::ListLocked => {
+                    let locked = auto_response.list_locked()?;
+                    for (uid, ts) in &locked {
+                        println!("uid={:<8} locked_at={}", uid, ts);
+                    }
+                    println!("─ {} locked uid(s) ─", locked.len());
+                }
             }
-            println!("─ {} alerts ─", alerts.len());
         }
 
         Commands::Mac { device, action } => {
@@ -298,6 +510,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Commands::Worm { device, action } => {
+            let db   = sled::open(&device)?;
+            let worm = ghostfs::worm::Worm::new(&db)?;
+            // Operacje CLI działają bezpośrednio na DB (bez FUSE/uid z
+            // requestu) — traktujemy je jako uprzywilejowane (root), tak
+            // jak `ghostfs mac` / `ghostfs canary` już to robią. Kontrola
+            // dostępu do samego wywołania `ghostfs worm ...` to
+            // odpowiedzialność uprawnień pliku urządzenia / sudo.
+            match action {
+                WormCommands::Lock { ino } => {
+                    worm.set_immutable(ino, true, true)?;
+                    println!("✓ ino={} locked (immutable)", ino);
+                }
+                WormCommands::Unlock { ino } => {
+                    worm.set_immutable(ino, false, true)?;
+                    println!("✓ ino={} unlocked", ino);
+                }
+                WormCommands::Retain { ino, until } => {
+                    worm.extend_retention(ino, until, true)?;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                    println!("✓ ino={} retained until unix_ts={} ({}s from now)", ino, until, until.saturating_sub(now));
+                }
+                WormCommands::Show { ino } => {
+                    let s = worm.get(ino)?;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                    println!("ino={}  immutable={}  retain_until={} ({})",
+                        ino, s.immutable, s.retention_until,
+                        if s.retention_until > now { format!("ACTIVE, {}s remaining", s.retention_until - now) }
+                        else if s.retention_until == 0 { "no hard retention".to_string() }
+                        else { "expired".to_string() });
+                }
+            }
+        }
+
         Commands::Canary { device, action } => {
             let db  = sled::open(&device)?;
             let ids = Ids::new(&db)?;
@@ -319,6 +565,229 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     println!("─ {} canaries ─", list.len());
                 }
+            }
+        }
+
+        Commands::Backup { device, output, key_file, passphrase, backup_passphrase, since_seq, changed_inodes } => {
+            let master_key = resolve_key(&device, key_file, passphrase)?;
+            let db = sled::open(&device)?;
+
+            // volume_uuid + block_size — czytamy z superblocka (verify z master_key
+            // po drodze potwierdza, że podane hasło/klucz faktycznie pasuje do wolumenu).
+            let sb = Superblock::load_and_verify(&db, &master_key)?;
+            // NOTE: `volume_uuid` used for block AAD binding lives only in the
+            // in-memory `Crypto` struct (regenerated per-mount, not persisted
+            // in the superblock) — see backup.rs module doc / README caveat.
+            // For the backup MANIFEST we only need a stable *identifier*, not
+            // the live AAD uuid (backup copies ciphertext 1:1, it never
+            // re-derives AAD), so we derive one deterministically from the
+            // superblock bytes — stable across mounts, good enough to tell
+            // "is this backup from the volume I think it is" at a glance.
+            let manifest_uuid = stable_volume_id(&sb);
+
+            let crypto = ghostfs::crypto::Crypto::new(master_key)?;
+            let (transport_key, custom, backup_kdf) = match &backup_passphrase {
+                Some(pass) => {
+                    let params = KdfParams::default();
+                    let key = kdf::derive_key(pass, &params)?.key;
+                    (key, true, Some(params))
+                }
+                None => (crypto.wrapping_key(), false, None),
+            };
+
+            let header = if let Some(seq) = since_seq {
+                if changed_inodes.is_empty() {
+                    return Err("--since-seq requires --changed-inodes <ino,ino,...> \
+                                (list inodes touched since that seq — see 'ghostfs forensics tail')".into());
+                }
+                println!("→ Incremental backup since seq={} ({} inode(s))...", seq, changed_inodes.len());
+                Backup::export_incremental(
+                    &db, manifest_uuid, sb.data.block_size,
+                    &transport_key, custom, backup_kdf, &output, seq, &changed_inodes,
+                )?
+            } else {
+                println!("→ Full backup of {}...", device.display());
+                Backup::export_full(
+                    &db, manifest_uuid, sb.data.block_size,
+                    &transport_key, custom, backup_kdf, &output,
+                )?
+            };
+
+            println!("✓ {} entries → {}", header.entry_count, output.display());
+            if custom {
+                println!("  Encrypted with a SEPARATE backup passphrase (not the volume key).");
+            } else {
+                println!("  Encrypted with the volume's wrapping key — restore needs the same \
+                           key-file/passphrase as the source volume (or its saved KDF params, \
+                           embedded in this backup file).");
+            }
+        }
+
+        Commands::Restore { input, device, key_file, passphrase, backup_passphrase } => {
+            let header = Backup::read_header(&input)?;
+            println!("Backup: created={} entries={} version={} incremental={}",
+                header.created_at, header.entry_count, header.ghostfs_version,
+                header.incremental_since_seq.map(|s| s.to_string()).unwrap_or_else(|| "no".into()));
+
+            let transport_key = if header.custom_passphrase {
+                let params = header.backup_kdf_params.clone()
+                    .ok_or("Backup marked custom_passphrase=true but has no embedded KDF params — corrupted header")?;
+                let pass = match backup_passphrase {
+                    Some(p) => p,
+                    None    => kdf::read_passphrase("Backup passphrase: ")?,
+                };
+                kdf::derive_key(&pass, &params)?.key
+            } else {
+                // Domyślny tryb: transport_key = wrapping_key(master_key).
+                // master_key odtwarzamy z --key-file LUB z --passphrase +
+                // source_kdf_params zapisanych w nagłówku backupu (działa
+                // nawet gdy oryginalny wolumin/device już nie istnieje).
+                let master_key: Key = if let Some(kf) = key_file {
+                    let hex_str = std::fs::read_to_string(&kf)?;
+                    let bytes = hex::decode(hex_str.trim())?;
+                    if bytes.len() != 32 { return Err("Key must be 32 bytes".into()); }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    arr
+                } else {
+                    let params = header.source_kdf_params.clone()
+                        .ok_or("Backup has no embedded source KDF params — provide --key-file instead of --passphrase")?;
+                    let pass = match passphrase {
+                        Some(p) => p,
+                        None    => kdf::read_passphrase("Original volume passphrase: ")?,
+                    };
+                    kdf::derive_key(&pass, &params)?.key
+                };
+                let crypto = ghostfs::crypto::Crypto::new(master_key)?;
+                crypto.wrapping_key()
+            };
+
+            println!("→ Restoring into new volume at {}...", device.display());
+            let n = Backup::import(&input, &device, &transport_key)?;
+            println!("✓ Imported {} entries → {}", n, device.display());
+            println!("  NOTE: block-level data is still encrypted under the ORIGINAL master key —");
+            println!("  mount the restored volume with the SAME key-file/passphrase you used on the source.");
+        }
+
+        Commands::TpmSealKey { key_file, output, pcr } => {
+            if output.exists() { return Err(format!("{} exists — refusing to overwrite", output.display()).into()); }
+            let hex_str = std::fs::read_to_string(&key_file)?;
+            let bytes = hex::decode(hex_str.trim())?;
+            if bytes.len() != 32 { return Err("Key file must contain a 32-byte hex key".into()); }
+
+            let seal = ghostfs::tpm::TpmSeal::new(pcr)?;
+            let blob = seal.seal_key(&bytes)?;
+            std::fs::write(&output, &blob)?;
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if ghostfs::tpm::TpmSeal::is_hardware_available() {
+                println!("✓ Key sealed to TPM (PCR {}) → {}", pcr, output.display());
+            } else {
+                println!("⚠ No TPM present — key sealed in SOFTWARE-ONLY mode (NO hardware");
+                println!("  protection, dev/test only) → {}", output.display());
+            }
+            println!("  Use with: ghostfs mount --sealed-key-file {} --tpm-pcr {} ...", output.display(), pcr);
+        }
+
+        Commands::BackupInfo { input } => {
+            let header = Backup::read_header(&input)?;
+            println!("GhostFS backup: {}", input.display());
+            println!("  version:            {}", header.ghostfs_version);
+            println!("  created_at:         {}", header.created_at);
+            println!("  volume_uuid:        {}", hex::encode(header.volume_uuid));
+            println!("  block_size:         {}", header.block_size);
+            println!("  entries:            {}", header.entry_count);
+            println!("  incremental_since:  {}", header.incremental_since_seq.map(|s| s.to_string()).unwrap_or_else(|| "no (full backup)".into()));
+            println!("  custom_passphrase:  {}", header.custom_passphrase);
+        }
+
+        Commands::Verify { device, key_file, passphrase, quick } => {
+            println!("═══ GhostFS security self-test: {} ═══", device.display());
+            let key = resolve_key(&device, key_file, passphrase)?;
+            let db = sled::open(&device)?;
+            let mut all_ok = true;
+
+            // 1. Superblock HMAC — proves the key is correct AND the
+            //    superblock (kdf params, volume_uuid, flags) is untampered.
+            let mut volume_uuid: Option<[u8; 16]> = None;
+            match Superblock::load_and_verify(&db, &key) {
+                Ok(sb) => {
+                    println!("[✓] superblock HMAC valid — version={} block_size={} volume_uuid={}",
+                        sb.data.version, sb.data.block_size, hex::encode(sb.data.volume_uuid));
+                    volume_uuid = Some(sb.data.volume_uuid);
+                }
+                Err(e) => { println!("[✗] SUPERBLOCK TAMPERED OR WRONG KEY: {}", e); all_ok = false; }
+            }
+
+            // 2. Audit log HMAC chain — detects retroactive edits/deletions
+            //    of the access log (each block is HMAC-signed with the
+            //    volume key at write time).
+            let mut audit = Audit::new(&db)?;
+            audit.set_signing_key(&key);
+            match audit.verify_signatures() {
+                Ok(n)  => println!("[✓] audit log intact — {} signed blocks", n),
+                Err(e) => { println!("[✗] AUDIT LOG TAMPERED: {}", e); all_ok = false; }
+            }
+
+            // 3. Forensics chain-of-custody — hash-chained (like a mini
+            //    blockchain) log of every access; a single deleted/edited
+            //    entry breaks every hash after it, which is the point.
+            let forensics = Forensics::new(&db)?;
+            match forensics.verify_chain() {
+                Ok(n)  => println!("[✓] forensics chain intact — {} entries (incl. WORM epoch seals)", n),
+                Err(e) => { println!("[✗] FORENSICS CHAIN BROKEN: {}", e); all_ok = false; }
+            }
+
+            // 4. IDS alert summary — not a pass/fail check, but surfaced
+            //    here because "the crypto checks out" and "nobody has been
+            //    probing this volume" are two different questions.
+            let ids = Ids::new(&db)?;
+            match ids.get_alerts(5) {
+                Ok(alerts) if !alerts.is_empty() => {
+                    println!("[!] {} recent IDS alert(s) — run 'ghostfs ids --device {} ' for details",
+                        alerts.len(), device.display());
+                }
+                Ok(_) => println!("[✓] no recent IDS alerts"),
+                Err(e) => println!("[?] could not read IDS alerts: {}", e),
+            }
+
+            // 5. Full block-level integrity scan (blake3 leaves vs stored
+            //    ciphertext, dedup refcount consistency) — the expensive
+            //    check, skippable with --quick on large volumes.
+            if quick {
+                println!("[·] skipping block-level integrity scan (--quick)");
+            } else if let Some(uuid) = volume_uuid {
+                println!("→ running full block-level integrity scan (this can take a while)...");
+                let crypto      = Crypto::new_with_uuid(key, uuid)?;
+                // Kompresja jest self-describing (magic header w każdym
+                // bloku — patrz data/compression.rs), więc typ podany tu
+                // przy konstrukcji nie ma znaczenia dla decompress().
+                let compression = Compression::new(CompressionType::None);
+                let dedup       = Deduplication::new(&db)?;
+                let versioning  = Versioning::new(&db)?;
+                let repair      = Repair::new(&db, &Some(crypto), &compression, &dedup, &versioning)?;
+                let (scanned, repaired) = repair.scan_report()?;
+                if repaired == 0 {
+                    println!("[✓] integrity scan: {} inodes scanned, 0 corrupted", scanned);
+                } else {
+                    println!("[!] integrity scan: {} inodes scanned, {} corrupted (auto-restored from \
+                              last known-good version where possible — check logs for any that couldn't be)",
+                              scanned, repaired);
+                    all_ok = false;
+                }
+            } else {
+                println!("[·] skipping block-level integrity scan — no verified volume_uuid to decrypt with \
+                          (superblock check above failed)");
+            }
+
+            println!("═══════════════════════════════════════════════");
+            if all_ok {
+                println!("RESULT: OK — no tampering detected.");
+            } else {
+                println!("RESULT: ISSUES FOUND — see [✗]/[!] lines above.");
+                std::process::exit(2);
             }
         }
 
@@ -363,6 +832,16 @@ fn resolve_key(
     else { kdf::read_passphrase("GhostFS passphrase: ")? };
 
     Ok(kdf::derive_key(&pass, &kdf_params)?.key)
+}
+
+/// Deterministyczny, stabilny (nie zmienia się między mountami) identyfikator
+/// wolumenu do celów samego manifestu backupu — patrz komentarz przy `Commands::Backup`.
+fn stable_volume_id(sb: &Superblock) -> [u8; 16] {
+    let bytes = bincode::serialize(&sb.data).unwrap_or_default();
+    let hash = blake3::hash(&bytes);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    id
 }
 
 fn level_from_u8(level: u8) -> Result<SensitivityLevel, Box<dyn std::error::Error>> {
