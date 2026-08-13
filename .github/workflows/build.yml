@@ -41,15 +41,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action@stable
-        continue-on-error: true
-
-      - name: Install Rust toolchain (fallback, pinned)
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + build artifacts
         uses: actions/cache@v4
