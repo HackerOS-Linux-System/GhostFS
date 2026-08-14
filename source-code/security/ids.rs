@@ -150,7 +150,11 @@ impl Ids {
     }
 
     /// Odnotuj dostęp i zaktualizuj profil UID z decay histogramu.
-    pub fn record_access(&self, uid: u32, ino: u64, access_mask: i32) -> Result<(), HfsError> {
+    /// Zwraca `true` jeśli TEN dostęp wywołał nowy alert (anomalia) —
+    /// pozwala wołającemu (np. `AutoResponse`) reagować tylko wtedy gdy
+    /// coś faktycznie się zmieniło, zamiast przeliczać stan przy KAŻDYM
+    /// dostępie do systemu plików (kosztowne na gorącej ścieżce FUSE).
+    pub fn record_access(&self, uid: u32, ino: u64, access_mask: i32) -> Result<bool, HfsError> {
         let now   = Self::now();
         let hour  = ((now / 3600) % 24) as u8;
 
@@ -166,7 +170,7 @@ impl Ids {
         if anomalous {
             self.add_alert(uid, ino, "Unusual access hour (nighttime anomaly)", access_mask)?;
         }
-        Ok(())
+        Ok(anomalous)
     }
 
     pub fn get_alerts(&self, limit: usize) -> Result<Vec<IdsAlert>, HfsError> {
@@ -181,6 +185,23 @@ impl Ids {
             .take(limit)
             .collect();
         Ok(alerts)
+    }
+
+    /// Policz alerty dla danego UID w ostatnich `window_secs` sekundach —
+    /// używane przez `security::response::AutoResponse` do decyzji o
+    /// eskalacji (warn → lockout). Skanuje cały prefix `ids:alert:`
+    /// (ograniczony przez ALERT_TTL_SECS + regularne `prune_alerts`), więc
+    /// koszt jest ograniczony niezależnie od tego jak długo wolumin żyje.
+    pub fn count_recent_alerts(&self, uid: u32, window_secs: u64) -> Result<u64, HfsError> {
+        let now    = Self::now();
+        let cutoff = now.saturating_sub(window_secs);
+        let count = self.db
+            .scan_prefix(b"ids:alert:")
+            .filter_map(|r| r.ok())
+            .filter_map(|(_, v)| bincode::deserialize::<IdsAlert>(&v).ok())
+            .filter(|a| a.uid == uid && a.timestamp >= cutoff)
+            .count() as u64;
+        Ok(count)
     }
 
     fn load_profile(&self, uid: u32, now: u64) -> Result<UidProfile, HfsError> {
