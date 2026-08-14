@@ -56,6 +56,13 @@ pub struct RateLimiter {
     /// UID-y z whitelisty — bez ograniczeń (red team tools).
     whitelist:  Arc<Mutex<std::collections::HashSet<u32>>>,
     evict_ctr:  Arc<Mutex<u64>>,
+    /// UID-y zablokowane CAŁKOWICIE (nie throttling — odmowa wszystkiego).
+    /// Ustawiane przez `security::response::AutoResponse` po przekroczeniu
+    /// progu powtarzających się alertów IDS. To jest w pamięci (per-mount);
+    /// trwały stan lockoutu żyje w DB przez `AutoResponse` tak, by
+    /// przetrwał remount — `GhostFS::new` odtwarza ten set z DB przy starcie
+    /// (patrz `fs/lib.rs`).
+    lockout:    Arc<Mutex<std::collections::HashSet<u32>>>,
 }
 
 impl RateLimiter {
@@ -67,7 +74,22 @@ impl RateLimiter {
             rate_bps,
             whitelist: Arc::new(Mutex::new(std::collections::HashSet::new())),
             evict_ctr: Arc::new(Mutex::new(0)),
+            lockout:   Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Zablokuj UID CAŁKOWICIE — `check_io` będzie zwracać `UidLockedOut`
+    /// niezależnie od whitelisty/budżetu. Wołane przez `AutoResponse`.
+    pub fn lock_uid(&self, uid: u32) {
+        self.lockout.lock().unwrap().insert(uid);
+    }
+
+    pub fn unlock_uid(&self, uid: u32) {
+        self.lockout.lock().unwrap().remove(&uid);
+    }
+
+    pub fn is_locked(&self, uid: u32) -> bool {
+        self.lockout.lock().unwrap().contains(&uid)
     }
 
     /// Dodaj UID do whitelisty (brak throttlingu — np. red team agent UID).
@@ -81,6 +103,13 @@ impl RateLimiter {
     }
 
     pub fn check_io(&self, uid: u32, bytes: u64) -> Result<(), HfsError> {
+        // Lockout jest sprawdzany PRZED root-bypassem świadomie NIE dotyczy
+        // root (AutoResponse nigdy nie blokuje uid=0 — patrz response.rs),
+        // ale sprawdzenie samo w sobie musi być pierwsze: całkowita blokada
+        // > throttling, niezależnie od whitelisty.
+        if self.lockout.lock().unwrap().contains(&uid) {
+            return Err(HfsError::UidLockedOut(uid));
+        }
         // Root i whitelista — bez ograniczeń.
         if uid == 0 || self.whitelist.lock().unwrap().contains(&uid) {
             return Ok(());
