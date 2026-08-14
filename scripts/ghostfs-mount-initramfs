@@ -1,7 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # /etc/initramfs-tools/scripts/local-top/ghostfs-mount
 # Initramfs BOOT script — mounts the GhostFS root partition before
 # pivot_root hands control to the init system.
+#
+# IMPORTANT: this script MUST be POSIX sh (dash-compatible), NOT bash.
+# initramfs-tools invokes local-top scripts via /bin/sh regardless of any
+# #!/usr/bin/env bash shebang (the initramfs's /bin/sh is dash on
+# Debian/Ubuntu, and update-initramfs also syntax-checks scripts with
+# `sh -n` at build time) — bash arrays, [[ ]], and `read -s` all cause a
+# hard "Syntax error" at boot (or at `update-initramfs -u` time) if used
+# here. Bash is NOT guaranteed to be present inside the initramfs image
+# at all unless separately copy_exec'd, which is unnecessary overhead
+# this script deliberately avoids.
 #
 # Install:
 #   cp ghostfs-mount-initramfs /etc/initramfs-tools/scripts/local-top/ghostfs-mount
@@ -14,8 +24,8 @@
 #      Skipped entirely if ghostfs.recovery=1 (forces step 2), or if the TPM
 #      state doesn't match (PCR mismatch -> boot chain changed since sealing).
 #   2. Interactive passphrase — prompted at the console (via plymouth if the
-#      splash is active, otherwise a plain `read -s`), up to
-#      GHOSTFS_MAX_ATTEMPTS tries.
+#      splash is active, otherwise a plain `read` with echo disabled via
+#      `stty -echo`), up to GHOSTFS_MAX_ATTEMPTS tries.
 #   3. Recovery shell — if both above fail (or ghostfs.recovery=1 was set and
 #      the user cancels), drop to a minimal `/bin/sh` inside the initramfs so
 #      the machine isn't just a dead black screen. Mirrors the standard
@@ -58,19 +68,19 @@ GHOSTFS_NOATIME=1
 
 for param in $(cat /proc/cmdline); do
     case "$param" in
-        ghostfs.device=*)         GHOSTFS_DEVICE="${param#ghostfs.device=}" ;;
-        ghostfs.cybersec=*)       GHOSTFS_CYBERSEC="${param#ghostfs.cybersec=}" ;;
-        ghostfs.keyfile=*)        GHOSTFS_KEYFILE="${param#ghostfs.keyfile=}" ;;
-        ghostfs.sealed_keyfile=*) GHOSTFS_SEALED_KEYFILE="${param#ghostfs.sealed_keyfile=}" ;;
-        ghostfs.tpm=*)            GHOSTFS_TPM="${param#ghostfs.tpm=}" ;;
-        ghostfs.tpm_pcr=*)        GHOSTFS_TPM_PCR="${param#ghostfs.tpm_pcr=}" ;;
-        ghostfs.recovery=*)       GHOSTFS_RECOVERY="${param#ghostfs.recovery=}" ;;
-        ghostfs.compression=*)    GHOSTFS_COMPRESSION="${param#ghostfs.compression=}" ;;
-        ghostfs.noatime=*)        GHOSTFS_NOATIME="${param#ghostfs.noatime=}" ;;
+        ghostfs.device=*)         GHOSTFS_DEVICE=${param#ghostfs.device=} ;;
+        ghostfs.cybersec=*)       GHOSTFS_CYBERSEC=${param#ghostfs.cybersec=} ;;
+        ghostfs.keyfile=*)        GHOSTFS_KEYFILE=${param#ghostfs.keyfile=} ;;
+        ghostfs.sealed_keyfile=*) GHOSTFS_SEALED_KEYFILE=${param#ghostfs.sealed_keyfile=} ;;
+        ghostfs.tpm=*)            GHOSTFS_TPM=${param#ghostfs.tpm=} ;;
+        ghostfs.tpm_pcr=*)        GHOSTFS_TPM_PCR=${param#ghostfs.tpm_pcr=} ;;
+        ghostfs.recovery=*)       GHOSTFS_RECOVERY=${param#ghostfs.recovery=} ;;
+        ghostfs.compression=*)    GHOSTFS_COMPRESSION=${param#ghostfs.compression=} ;;
+        ghostfs.noatime=*)        GHOSTFS_NOATIME=${param#ghostfs.noatime=} ;;
     esac
 done
 
-if [[ -z "$GHOSTFS_DEVICE" ]]; then
+if [ -z "$GHOSTFS_DEVICE" ]; then
     # Not a GhostFS boot — exit silently
     exit 0
 fi
@@ -83,7 +93,7 @@ log_begin_msg "GhostFS: mounting root from $GHOSTFS_DEVICE"
 # unlock fails, give the operator a way to inspect /dev, retry manually, or
 # fsck the underlying block device.
 ghostfs_recovery_shell() {
-    local reason="$1"
+    reason="$1"
     log_failure_msg "GhostFS: entering recovery shell — $reason"
     echo ""
     echo "==================================================================="
@@ -91,7 +101,7 @@ ghostfs_recovery_shell() {
     echo " Reason: $reason"
     echo ""
     echo " You are in a minimal initramfs shell. Useful commands:"
-    echo "   ghostfs mount --device $GHOSTFS_DEVICE --mountpoint \${rootmnt} \\"
+    printf '   ghostfs mount --device %s --mountpoint %s \\\n' "$GHOSTFS_DEVICE" "$rootmnt"
     echo "                 --passphrase   (will prompt)"
     echo "   exit                          # resume normal boot script (retries)"
     echo "==================================================================="
@@ -103,26 +113,30 @@ ghostfs_recovery_shell() {
 
 # ── Load FUSE ─────────────────────────────────────────────────────────────────
 modprobe fuse 2>/dev/null || true
-[[ -e /dev/fuse ]] || mknod /dev/fuse c 10 229
+[ -e /dev/fuse ] || mknod /dev/fuse c 10 229
 
 # ── Wait for device ───────────────────────────────────────────────────────────
-for i in $(seq 1 20); do
-    [[ -e "$GHOSTFS_DEVICE" ]] && break
+i=0
+while [ "$i" -lt 20 ]; do
+    [ -e "$GHOSTFS_DEVICE" ] && break
     sleep 0.5
+    i=$((i + 1))
 done
-if [[ ! -e "$GHOSTFS_DEVICE" ]]; then
+if [ ! -e "$GHOSTFS_DEVICE" ]; then
     ghostfs_recovery_shell "device $GHOSTFS_DEVICE never appeared"
     exit 1
 fi
 
 # ── Attempt 1: TPM early-boot unlock (no user interaction) ────────────────────
-KEY_ARGS=()
+# POSIX sh has no arrays — key-selection args are accumulated into the
+# positional parameters via `set --` instead (see below), which is the
+# standard portable idiom for building argument lists in dash/ash.
 UNLOCKED=0
 
-if [[ "$GHOSTFS_TPM" == "1" && "$GHOSTFS_RECOVERY" != "1" ]]; then
-    if [[ -f "$GHOSTFS_SEALED_KEYFILE" ]]; then
+if [ "$GHOSTFS_TPM" = "1" ] && [ "$GHOSTFS_RECOVERY" != "1" ]; then
+    if [ -f "$GHOSTFS_SEALED_KEYFILE" ]; then
         log_begin_msg "GhostFS: attempting TPM unlock (PCR $GHOSTFS_TPM_PCR)"
-        KEY_ARGS=(--sealed-key-file "$GHOSTFS_SEALED_KEYFILE" --tpm-pcr "$GHOSTFS_TPM_PCR")
+        KEY_MODE="tpm"
         UNLOCKED=1
         log_end_msg 0
     else
@@ -131,70 +145,83 @@ if [[ "$GHOSTFS_TPM" == "1" && "$GHOSTFS_RECOVERY" != "1" ]]; then
 fi
 
 # ── Attempt 2: plaintext keyfile bundled in initramfs (least preferred) ───────
-if [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" == "1" && "$GHOSTFS_RECOVERY" != "1" && -f "$GHOSTFS_KEYFILE" ]]; then
-    KEY_ARGS=(--key-file "$GHOSTFS_KEYFILE")
+if [ "$UNLOCKED" = "0" ] && [ "$GHOSTFS_CYBERSEC" = "1" ] && [ "$GHOSTFS_RECOVERY" != "1" ] && [ -f "$GHOSTFS_KEYFILE" ]; then
+    KEY_MODE="keyfile"
     UNLOCKED=1
 fi
 
 # ── Attempt 3: interactive passphrase (console or plymouth splash) ────────────
+# Echoes the prompted passphrase to stdout (captured via command substitution
+# by the caller) — the PROMPT itself goes to stderr/console so it never ends
+# up mixed into the captured value.
 prompt_passphrase() {
-    local attempt="$1"
+    attempt="$1"
     if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
-        plymouth ask-for-password \
-            --prompt "GhostFS passphrase (attempt ${attempt}/${GHOSTFS_MAX_ATTEMPTS})"
-    else
-        # Plain console fallback — no splash active.
-        echo -n "GhostFS passphrase (attempt ${attempt}/${GHOSTFS_MAX_ATTEMPTS}): " > /dev/console
-        local pass
-        read -rs pass < /dev/console
-        echo "" > /dev/console
-        echo "$pass"
+        plymouth ask-for-password --prompt "GhostFS passphrase (attempt ${attempt}/${GHOSTFS_MAX_ATTEMPTS})"
+        return
     fi
+    # Plain console fallback — no splash active. `stty -echo` is the
+    # POSIX-portable way to suppress echo (bash's `read -s` is not available
+    # in dash/ash).
+    printf 'GhostFS passphrase (attempt %s/%s): ' "$attempt" "$GHOSTFS_MAX_ATTEMPTS" > /dev/console
+    stty -echo < /dev/console 2>/dev/null
+    read -r pass < /dev/console
+    stty echo < /dev/console 2>/dev/null
+    echo "" > /dev/console
+    echo "$pass"
 }
 
-if [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" == "1" ]]; then
-    for attempt in $(seq 1 "$GHOSTFS_MAX_ATTEMPTS"); do
-        pass="$(prompt_passphrase "$attempt")"
-        [[ -z "$pass" ]] && continue
-        KEY_ARGS=(--passphrase "$pass")
-        UNLOCKED=1
-        # We can't cheaply verify the passphrase before a real mount attempt
-        # (that requires reading+HMAC-checking the superblock), so we just
-        # try the mount below; if it fails we loop back here.
-        break
+if [ "$UNLOCKED" = "0" ] && [ "$GHOSTFS_CYBERSEC" = "1" ]; then
+    attempt=1
+    while [ "$attempt" -le "$GHOSTFS_MAX_ATTEMPTS" ]; do
+        pass=$(prompt_passphrase "$attempt")
+        if [ -n "$pass" ]; then
+            KEY_MODE="passphrase"
+            UNLOCKED=1
+            # Nie da się tanio zweryfikować hasła przed właściwą próbą mountu
+            # (to wymaga odczytu+weryfikacji HMAC superblocka) — próbujemy
+            # mount poniżej; jeśli się nie uda, pętla retry tam obsłuży ponowne pytanie.
+            break
+        fi
+        attempt=$((attempt + 1))
     done
-    if [[ "$UNLOCKED" == "0" ]]; then
+    if [ "$UNLOCKED" = "0" ]; then
         ghostfs_recovery_shell "no passphrase entered after $GHOSTFS_MAX_ATTEMPTS attempts"
     fi
-elif [[ "$UNLOCKED" == "0" && "$GHOSTFS_CYBERSEC" != "1" ]]; then
+elif [ "$UNLOCKED" = "0" ] && [ "$GHOSTFS_CYBERSEC" != "1" ]; then
     # Normal (non-cybersec) mode — encryption optional, no key needed.
+    KEY_MODE="none"
     UNLOCKED=1
 fi
-
-# ── Build mount arguments ─────────────────────────────────────────────────────
-ARGS=(mount --device "$GHOSTFS_DEVICE" --mountpoint "${rootmnt}" \
-      --compression "$GHOSTFS_COMPRESSION")
-[[ "$GHOSTFS_NOATIME" == "1" ]] && ARGS+=(--noatime)
-ARGS+=("${KEY_ARGS[@]}")
 
 # ── Mount (with retry-on-wrong-passphrase loop) ────────────────────────────────
 mount_attempt=0
 MOUNT_OK=0
-while [[ $mount_attempt -lt $GHOSTFS_MAX_ATTEMPTS ]]; do
+while [ "$mount_attempt" -lt "$GHOSTFS_MAX_ATTEMPTS" ]; do
     mount_attempt=$((mount_attempt + 1))
 
-    /usr/local/bin/ghostfs "${ARGS[@]}" &
+    set -- mount --device "$GHOSTFS_DEVICE" --mountpoint "$rootmnt" --compression "$GHOSTFS_COMPRESSION"
+    [ "$GHOSTFS_NOATIME" = "1" ] && set -- "$@" --noatime
+    case "$KEY_MODE" in
+        tpm)        set -- "$@" --sealed-key-file "$GHOSTFS_SEALED_KEYFILE" --tpm-pcr "$GHOSTFS_TPM_PCR" ;;
+        keyfile)    set -- "$@" --key-file "$GHOSTFS_KEYFILE" ;;
+        passphrase) set -- "$@" --passphrase "$pass" ;;
+    esac
+
+    /usr/local/bin/ghostfs "$@" &
     GPID=$!
 
     ok=0
-    for i in $(seq 1 20); do
-        if mount | grep -q "${rootmnt}"; then ok=1; break; fi
+    j=0
+    while [ "$j" -lt 20 ]; do
+        if mount | grep -q "$rootmnt"; then ok=1; break; fi
         # Process died early (e.g. wrong passphrase -> HMAC verify failed)?
         kill -0 "$GPID" 2>/dev/null || break
         sleep 0.5
+        j=$((j + 1))
     done
 
-    if [[ "$ok" == "1" ]]; then
+    if [ "$ok" = "1" ]; then
         MOUNT_OK=1
         break
     fi
@@ -204,18 +231,15 @@ while [[ $mount_attempt -lt $GHOSTFS_MAX_ATTEMPTS ]]; do
 
     # Only retry the passphrase prompt in cybersec mode with no TPM unlock —
     # a bad TPM/keyfile unlock won't fix itself by looping.
-    if [[ "$GHOSTFS_CYBERSEC" == "1" && "$GHOSTFS_TPM" != "1" ]]; then
-        pass="$(prompt_passphrase "$((mount_attempt + 1))")"
-        ARGS=(mount --device "$GHOSTFS_DEVICE" --mountpoint "${rootmnt}" \
-              --compression "$GHOSTFS_COMPRESSION")
-        [[ "$GHOSTFS_NOATIME" == "1" ]] && ARGS+=(--noatime)
-        [[ -n "$pass" ]] && ARGS+=(--passphrase "$pass")
+    if [ "$GHOSTFS_CYBERSEC" = "1" ] && [ "$GHOSTFS_TPM" != "1" ]; then
+        pass=$(prompt_passphrase "$((mount_attempt + 1))")
+        KEY_MODE="passphrase"
     else
         break
     fi
 done
 
-if [[ "$MOUNT_OK" != "1" ]]; then
+if [ "$MOUNT_OK" != "1" ]; then
     ghostfs_recovery_shell "mount failed after $mount_attempt attempt(s) — wrong passphrase, corrupted superblock, or device I/O error"
     exit 1
 fi
