@@ -3,7 +3,6 @@
 use tokio::sync::broadcast;
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
-use crate::error::HfsError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForensicsEvent {
