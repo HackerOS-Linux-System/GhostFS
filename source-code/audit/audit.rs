@@ -29,6 +29,7 @@ pub struct AuditBlockSig {
     pub hmac:      [u8; 32],
 }
 
+#[derive(Clone)]
 pub struct Audit {
     db:          Db,
     signing_key: Option<Key>,
