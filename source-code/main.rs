@@ -109,6 +109,32 @@ enum Commands {
         #[command(subcommand)] action: MacCommands,
     },
 
+    /// Manual panic button — deny ALL access (including root) on this
+    /// volume, on every current and future mount, until explicitly
+    /// disabled. See security/response.rs::enable_global_lockdown.
+    Lockdown {
+        #[arg(short, long)] device: PathBuf,
+        #[command(subcommand)] action: LockdownCommands,
+    },
+
+    /// Shamir's Secret Sharing — split a key file into N shares, M of which
+    /// are needed to reconstruct it. See security/shamir.rs.
+    Shamir {
+        #[command(subcommand)] action: ShamirCommands,
+    },
+
+    /// Ransomware behavior detection — see security/ransomware.rs.
+    Ransomware {
+        #[arg(short, long)] device: PathBuf,
+        #[command(subcommand)] action: RansomwareCommands,
+    },
+
+    /// SIEM integration (syslog RFC 5424) — see security/syslog.rs.
+    Siem {
+        #[arg(short, long)] device: PathBuf,
+        #[command(subcommand)] action: SiemCommands,
+    },
+
     /// WORM / immutable file protection — see security/worm.rs.
     Worm {
         #[arg(short, long)] device: PathBuf,
@@ -238,6 +264,55 @@ enum CanaryCommands {
 }
 
 #[derive(Subcommand)]
+enum LockdownCommands {
+    Enable  { #[arg(long)] reason: String },
+    Disable,
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ShamirCommands {
+    /// Split a 32-byte hex key file into N shares, M needed to reconstruct.
+    Split {
+        #[arg(long)] key_file:   PathBuf,
+        #[arg(long)] shares:     u8,
+        #[arg(long)] threshold:  u8,
+        #[arg(long)] output_dir: PathBuf,
+    },
+    /// Reconstruct a key file from >= threshold share files.
+    Combine {
+        #[arg(long, value_delimiter = ',')] share_files: Vec<PathBuf>,
+        #[arg(long)] output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RansomwareCommands {
+    Enable,
+    Disable,
+    /// Exempt a UID from detection (backup/transcode/compression tools —
+    /// legitimately write lots of high-entropy data in bulk).
+    Allow    { #[arg(long)] uid: u32 },
+    Disallow { #[arg(long)] uid: u32 },
+}
+
+#[derive(Subcommand)]
+enum SiemCommands {
+    /// Configure the syslog endpoint (host:port, UDP) events are sent to.
+    Configure {
+        #[arg(long)] endpoint: String,
+        /// Syslog facility (0-23). Default 16 (local0).
+        #[arg(long)] facility: Option<u8>,
+    },
+    Disable,
+    /// Send a test message end-to-end (verify your SIEM actually receives it).
+    Test,
+    /// Stream EVERY audit entry (not just security alerts) to SIEM live —
+    /// see SyslogSender::set_stream_audit for throughput trade-offs.
+    StreamAudit { #[arg(long)] on: bool },
+}
+
+#[derive(Subcommand)]
 enum WormCommands {
     /// Set immutable flag (equivalent of `chattr +i`) — root only, and only
     /// clearable while no active hard retention is set (see `Retain`).
@@ -273,6 +348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Mount { device, mountpoint, key_file, passphrase, sealed_key_file, tpm_pcr, compression, noatime, allow_other, rate_limit_mb, strict } => {
+            ghostfs::memlock::harden_process();
             let key = if let Some(sealed) = sealed_key_file {
                 let blob = std::fs::read(&sealed)
                     .map_err(|e| format!("Cannot read sealed key blob {}: {}", sealed.display(), e))?;
@@ -393,7 +469,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let quota = Quota::new(&db)?;
             match action {
                 QuotaCommands::Set  { uid, limit } => { quota.set_limit(uid, limit)?; println!("✓ uid={} limit={}B", uid, limit); }
-                QuotaCommands::Show { uid }        => { quota.show(uid)?; }
+                QuotaCommands::Show { uid }        => {
+                    let (used, limit) = quota.get_usage(uid)?;
+                    if limit == 0 {
+                        println!("uid={:<8} used={}B  limit=unlimited", uid, used);
+                    } else {
+                        let pct = (used as f64 / limit as f64) * 100.0;
+                        println!("uid={:<8} used={}B  limit={}B  ({:.1}%)", uid, used, limit, pct);
+                    }
+                }
             }
         }
 
@@ -506,6 +590,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MacCommands::ShowClearance { uid } => {
                     let c = mac.get_clearance(uid)?;
                     println!("uid={}  level={:?}  comps=0x{:x}  trusted={}", uid, c.level, c.compartments, c.trusted);
+                }
+            }
+        }
+
+        Commands::Lockdown { device, action } => {
+            let db = sled::open(&device)?;
+            let auto_response = ghostfs::response::AutoResponse::new(&db)?;
+            match action {
+                LockdownCommands::Enable { reason } => {
+                    auto_response.enable_global_lockdown(&reason)?;
+                    println!("🔒 LOCKDOWN ENABLED — ALL access denied (including root) on every mount of this volume.");
+                    println!("   Reason: {}", reason);
+                    println!("   Clear with: ghostfs lockdown disable --device {}", device.display());
+                }
+                LockdownCommands::Disable => {
+                    auto_response.disable_global_lockdown()?;
+                    println!("✓ lockdown disabled — access restored");
+                }
+                LockdownCommands::Status => {
+                    match auto_response.is_global_lockdown()? {
+                        Some(reason) => println!("🔒 LOCKDOWN ACTIVE — reason: {}", reason),
+                        None         => println!("✓ no active lockdown"),
+                    }
+                }
+            }
+        }
+
+        Commands::Shamir { action } => {
+            ghostfs::memlock::harden_process();
+            match action {
+                ShamirCommands::Split { key_file, shares, threshold, output_dir } => {
+                    let hex_str = std::fs::read_to_string(&key_file)?;
+                    let bytes = hex::decode(hex_str.trim())?;
+                    if bytes.len() != 32 { return Err("Key file must contain a 32-byte hex key".into()); }
+                    let mut secret = [0u8; 32];
+                    secret.copy_from_slice(&bytes);
+
+                    let share_list = ghostfs::shamir::split(&secret, shares, threshold)?;
+                    std::fs::create_dir_all(&output_dir)?;
+                    println!("✓ split into {} shares, {} needed to reconstruct:", shares, threshold);
+                    for s in &share_list {
+                        let path = output_dir.join(format!("share-{}-of-{}.txt", s.index, shares));
+                        std::fs::write(&path, s.serialize())?;
+                        #[cfg(unix)] {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                        }
+                        println!("  {}", path.display());
+                    }
+                    println!(
+                        "\nDistribute each share to a DIFFERENT custodian, over a DIFFERENT channel \
+                         if possible. Any {} of these {} shares reconstruct the key; fewer than {} \
+                         reveal mathematically ZERO information about it (information-theoretic \
+                         security, not just 'hard to guess').", threshold, shares, threshold
+                    );
+                }
+                ShamirCommands::Combine { share_files, output } => {
+                    if output.exists() { return Err(format!("{} exists — refusing to overwrite", output.display()).into()); }
+                    let mut share_list = Vec::new();
+                    for f in &share_files {
+                        let content = std::fs::read_to_string(f)
+                            .map_err(|e| format!("Cannot read share file {}: {}", f.display(), e))?;
+                        share_list.push(ghostfs::shamir::Share::deserialize(&content)?);
+                    }
+                    let secret = ghostfs::shamir::combine(&share_list)?;
+                    std::fs::write(&output, hex::encode(secret))?;
+                    #[cfg(unix)] {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    println!("✓ reconstructed key from {} share(s) → {}", share_files.len(), output.display());
+                    println!("  Use with: ghostfs mount --key-file {} ...", output.display());
+                }
+            }
+        }
+
+        Commands::Ransomware { device, action } => {
+            let db    = sled::open(&device)?;
+            let ids   = Ids::new(&db)?;
+            let guard = ghostfs::ransomware::RansomwareGuard::new(&db, &ids)?;
+            match action {
+                RansomwareCommands::Enable  => { guard.set_enabled(true)?;  println!("✓ ransomware detection enabled"); }
+                RansomwareCommands::Disable => { guard.set_enabled(false)?; println!("✓ ransomware detection disabled — NOT recommended for production"); }
+                RansomwareCommands::Allow    { uid } => { guard.allow_uid(uid)?;    println!("✓ uid={} exempted from ransomware detection", uid); }
+                RansomwareCommands::Disallow { uid } => { guard.disallow_uid(uid)?; println!("✓ uid={} no longer exempted", uid); }
+            }
+        }
+
+        Commands::Siem { device, action } => {
+            let db     = sled::open(&device)?;
+            let syslog = ghostfs::syslog::SyslogSender::new(&db)?;
+            match action {
+                SiemCommands::Configure { endpoint, facility } => {
+                    syslog.configure(&endpoint, facility)?;
+                    println!("✓ SIEM endpoint configured: {} (facility={})", endpoint, facility.unwrap_or(16));
+                }
+                SiemCommands::Disable => {
+                    syslog.disable()?;
+                    println!("✓ SIEM integration disabled");
+                }
+                SiemCommands::Test => {
+                    syslog.send(
+                        ghostfs::syslog::Severity::Notice, "TEST",
+                        "GhostFS SIEM test message — if you see this, syslog delivery works.",
+                    );
+                    // send() jest fire-and-forget (osobny wątek) — dajemy mu
+                    // chwilę, żeby faktycznie zdążył wysłać zanim proces CLI
+                    // się zakończy i wątek zostanie ubity razem z nim.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    println!("✓ test message sent (check your SIEM/syslog receiver)");
+                }
+                SiemCommands::StreamAudit { on } => {
+                    syslog.set_stream_audit(on)?;
+                    if on {
+                        println!("✓ full audit streaming ENABLED — every logged operation now also goes to SIEM live.");
+                        println!("  Not recommended for high-throughput workloads without a local rsyslog/syslog-ng relay.");
+                    } else {
+                        println!("✓ full audit streaming disabled (security alerts still stream regardless)");
+                    }
                 }
             }
         }
@@ -670,6 +873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::TpmSealKey { key_file, output, pcr } => {
+            ghostfs::memlock::harden_process();
             if output.exists() { return Err(format!("{} exists — refusing to overwrite", output.display()).into()); }
             let hex_str = std::fs::read_to_string(&key_file)?;
             let bytes = hex::decode(hex_str.trim())?;
@@ -792,6 +996,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Keygen { output } => {
+            ghostfs::memlock::harden_process();
             if output.exists() { return Err(format!("{} exists — refusing overwrite", output.display()).into()); }
             let key: [u8; 32] = rand::random();
             std::fs::write(&output, hex::encode(key))?;
