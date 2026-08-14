@@ -1,4 +1,6 @@
 use crate::error::HfsError;
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use zeroize::Zeroize;
 
 // ── Real TPM implementation (feature = "tpm") ─────────────────────────────
@@ -261,20 +263,50 @@ impl TpmSeal {
     }
 
     // ── Software-only implementation (DEV/TEST ONLY) ─────────────────────
+    //
+    // v0.4 FIX: poprzednia implementacja była kryptograficznie zepsuta —
+    // `seal_software` maskowała klucz przez XOR z `hash(pcr_index || key)`,
+    // czyli maska ZALEŻAŁA od samego klucza, którego `unseal_software` z
+    // definicji jeszcze nie zna. `unseal_software` w rezultacie zwracała
+    // zamaskowane bajty WPROST, bez żadnego odwrócenia — realny bug, nie
+    // tylko "słabe zabezpieczenie dla dev/test", bo odzyskany "klucz" był
+    // zwyczajnie NIEPRAWIDŁOWY (nigdy nie równał się oryginalnemu `key`).
+    //
+    // Nowa implementacja: prawdziwe (odwracalne) AES-256-GCM z kluczem
+    // wyprowadzonym z tożsamości maszyny (`/etc/machine-id`) + losowej soli
+    // zapisanej w blobie. To WCIĄŻ nie jest ochrona sprzętowa — ktoś z
+    // dostępem do tego samego `/etc/machine-id` (czyli root na tej samej
+    // maszynie) może odtworzyć klucz seal-key i odpieczętować blob. Ale to
+    // uczciwe, działające przybliżenie: blob jest bezużyteczny bez
+    // dostępu do TEJ konkretnej maszyny, i (w przeciwieństwie do poprzedniej
+    // wersji) faktycznie się poprawnie odszyfrowuje.
+    //
+    // Analogiczne do "soft PCR": zamiast prawdziwych wartości PCR (TPM),
+    // wiążemy blob z hashem (machine-id || kernel release), więc zmiana
+    // maszyny/reinstalacja jądra unieważnia blob — przybliżenie "boot chain
+    // changed" detection bez prawdziwego TPM.
 
-    /// Zapieczętowanie software: XOR z hash(pcr_index || key) — BRAK realnej ochrony.
-    /// Wyraźnie ostrzega przy każdym użyciu.
     fn seal_software(&self, key: &[u8]) -> Result<Vec<u8>, HfsError> {
         log::warn!("TPM software seal: NO hardware protection — dev/test mode only");
-        let mut mask = blake3::hash(
-            &[&self.pcr_index.to_le_bytes()[..], key].concat()
-        ).as_bytes().to_vec();
-        // XOR key z maską dla minimalnego zaciemnienia.
-        let private: Vec<u8> = key.iter().zip(mask.iter().cycle()).map(|(b, m)| b ^ m).collect();
-        mask.zeroize();
+        let salt: [u8; 16] = rand::random();
+        let mut seal_key = Self::derive_software_seal_key(self.pcr_index, &salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&seal_key).map_err(|_| HfsError::CryptoError)?;
+        seal_key.zeroize();
+        let nonce_bytes: [u8; 12] = rand::random();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let aad = Self::soft_pcr_snapshot(self.pcr_index)?;
+        let ciphertext = cipher
+            .encrypt(nonce, Payload { msg: key, aad: &aad })
+            .map_err(|_| HfsError::CryptoError)?;
+
+        let mut private = Vec::with_capacity(16 + 12 + ciphertext.len());
+        private.extend_from_slice(&salt);
+        private.extend_from_slice(&nonce_bytes);
+        private.extend_from_slice(&ciphertext);
+
         let blob = SealedBlob {
             pcr_index:    self.pcr_index,
-            pcr_snapshot: b"software-mode-no-pcr".to_vec(),
+            pcr_snapshot: aad,
             private,
             public:       Vec::new(),
         };
@@ -291,11 +323,81 @@ impl TpmSeal {
                 blob.pcr_index, self.pcr_index
             )));
         }
-        // Odtwórz maskę — musimy znać oryginalny klucz by odtworzyć maską.
-        // W trybie software nie możemy zweryfikować PCR, więc zwracamy wprost.
-        // Uwaga: poniższy XOR nie jest deterministyczny bez oryginalnego klucza —
-        // w trybie software dane nie są realnie chronione.
-        Ok(blob.private)
+
+        // "Soft PCR" check — analog wykrywania zmiany boot chain bez
+        // prawdziwego TPM: jeśli machine-id/kernel się zmieniły od
+        // momentu sealowania, odmawiamy (tak jak prawdziwy TPM odmówiłby
+        // unseal po zmianie PCR).
+        let current = Self::soft_pcr_snapshot(self.pcr_index)?;
+        if current != blob.pcr_snapshot {
+            return Err(HfsError::TpmError(
+                "Soft-PCR mismatch — machine-id or kernel changed since sealing \
+                 (software mode has no real TPM, this is a best-effort approximation). \
+                 Boot with ghostfs.recovery=1 to unlock with a passphrase instead.".into()
+            ));
+        }
+
+        if blob.private.len() < 16 + 12 {
+            return Err(HfsError::TpmError("Corrupted software sealed blob (too short)".into()));
+        }
+        let salt        = &blob.private[..16];
+        let nonce_bytes  = &blob.private[16..28];
+        let ciphertext   = &blob.private[28..];
+
+        let seal_key = Self::derive_software_seal_key(self.pcr_index, salt)?;
+        let cipher   = Aes256Gcm::new_from_slice(&seal_key).map_err(|_| HfsError::CryptoError)?;
+        let nonce    = Nonce::from_slice(nonce_bytes);
+        let key = cipher
+            .decrypt(nonce, Payload { msg: ciphertext, aad: &blob.pcr_snapshot })
+            .map_err(|_| HfsError::TpmError(
+                "Software unseal failed — wrong machine, corrupted blob, or tampering".into()
+            ))?;
+        let mut seal_key = seal_key;
+        seal_key.zeroize();
+        Ok(key)
+    }
+
+    /// Klucz seal-key dla trybu software: KDF(machine-id || pcr_index || salt).
+    /// Bez prawdziwego TPM to jedyne "coś czego atakujący nie ma" bez
+    /// dostępu do samej maszyny — nie udajemy, że to jest bezpieczeństwo
+    /// sprzętowe, ale to i tak nieporównywalnie lepsze niż klucz odzyskiwalny
+    /// z samego bloba (jak w poprzedniej, zepsutej implementacji).
+    fn derive_software_seal_key(pcr_index: u32, salt: &[u8]) -> Result<[u8; 32], HfsError> {
+        let machine_id = Self::read_machine_id();
+        let mut h = blake3::Hasher::new();
+        h.update(b"ghostfs-tpm-software-seal-v1");
+        h.update(machine_id.as_bytes());
+        h.update(&pcr_index.to_le_bytes());
+        h.update(salt);
+        Ok(*h.finalize().as_bytes())
+    }
+
+    fn read_machine_id() -> String {
+        for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let s = s.trim();
+                if !s.is_empty() { return s.to_string(); }
+            }
+        }
+        log::warn!(
+            "TPM software mode: no /etc/machine-id found — using a fixed fallback identity. \
+             This means sealed blobs are NOT bound to this specific machine. Install \
+             `systemd` (or run `systemd-machine-id-setup`) to get a real machine-id."
+        );
+        "ghostfs-no-machine-id-fallback".to_string()
+    }
+
+    /// "Soft PCR": hash(machine-id || kernel release || pcr_index) — best-effort
+    /// stand-in for a real PCR measurement when no TPM is present.
+    fn soft_pcr_snapshot(pcr_index: u32) -> Result<Vec<u8>, HfsError> {
+        let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .unwrap_or_else(|_| "unknown-kernel".to_string());
+        let mut h = blake3::Hasher::new();
+        h.update(b"ghostfs-soft-pcr-v1");
+        h.update(Self::read_machine_id().as_bytes());
+        h.update(kernel_release.trim().as_bytes());
+        h.update(&pcr_index.to_le_bytes());
+        Ok(h.finalize().as_bytes().to_vec())
     }
 
     /// Sprawdź czy system posiada dostępny TPM 2.0.
