@@ -177,4 +177,73 @@ impl Forensics {
         }
         Ok(out)
     }
+
+    /// Eksportuj CAŁY chain-of-custody log do jednego pliku, podpisany
+    /// kluczem Ed25519 wolumenu — weryfikowalny przez stronę trzecią
+    /// (audytora, sąd) BEZ dostępu do wolumenu ani master key, wyłącznie
+    /// na podstawie klucza publicznego przekazanego wcześniej (patrz
+    /// `security/signing.rs`). Odmawia eksportu jeśli łańcuch hash jest
+    /// naruszony — podpisanie uszkodzonych danych dałoby fałszywe poczucie
+    /// autentyczności.
+    ///
+    /// Format pliku: `b"GFSFOR01"` || u32 LE manifest_len || manifest
+    /// (bincode) || payload (bincode-owana lista `ForensicsEntry`, to
+    /// dokładnie to, czego hash jest podpisany w manifeście).
+    pub fn export_signed(
+        &self,
+        output: &std::path::Path,
+        crypto: &crate::crypto::Crypto,
+    ) -> Result<crate::signing::SignedExportManifest, HfsError> {
+        let head = self.verify_chain()?;
+        let entries = self.tail(head as usize)?;
+        let payload = bincode::serialize(&entries)?;
+        let payload_hash = *blake3::hash(&payload).as_bytes();
+
+        let signer = crate::signing::ForensicsSigner::load_or_generate(&self.db, crypto)?;
+        let signature = signer.sign(&payload_hash);
+
+        let manifest = crate::signing::SignedExportManifest {
+            ghostfs_version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            entry_count: entries.len() as u64,
+            payload_hash,
+            signature,
+            public_key_hex: signer.public_key_hex(),
+        };
+
+        let manifest_bytes = bincode::serialize(&manifest)?;
+        use std::io::Write;
+        let mut file = std::fs::File::create(output)?;
+        file.write_all(b"GFSFOR01")?;
+        file.write_all(&(manifest_bytes.len() as u32).to_le_bytes())?;
+        file.write_all(&manifest_bytes)?;
+        file.write_all(&payload)?;
+        Ok(manifest)
+    }
+
+    /// Odczytaj podpisany eksport i zwróć (manifest, payload) do weryfikacji
+    /// przez `signing::verify_signed_export`. Rozdzielone od weryfikacji
+    /// celowo — to pozwala audytorowi wczytać plik jednym narzędziem i
+    /// zweryfikować innym, bez żadnej zależności od GhostFS/sled.
+    pub fn read_signed_export(
+        input: &std::path::Path,
+    ) -> Result<(crate::signing::SignedExportManifest, Vec<u8>), HfsError> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(input)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        if &magic != b"GFSFOR01" {
+            return Err(HfsError::BackupCorrupted);
+        }
+        let mut len_buf = [0u8; 4];
+        file.read_exact(&mut len_buf)?;
+        let mlen = u32::from_le_bytes(len_buf) as usize;
+        let mut manifest_bytes = vec![0u8; mlen];
+        file.read_exact(&mut manifest_bytes)?;
+        let manifest: crate::signing::SignedExportManifest = bincode::deserialize(&manifest_bytes)?;
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload)?;
+        Ok((manifest, payload))
+    }
 }
