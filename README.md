@@ -87,3 +87,101 @@ the implementation:
   full UID lockout (fail-closed on every subsequent op, persisted across
   remounts) at 6. MAC policy denials now also feed the IDS instead of only
   going to `log::debug!`. Manage with `ghostfs ids list|lock|unlock|list-locked`.
+
+## SIEM integration & dead man's switch (v0.5)
+
+- **`ghostfs siem configure --device <dev> --endpoint host:port [--facility N]`**
+  — sends security events (IDS lockouts, canary triggers, chain-integrity
+  violations) as standard RFC 5424 syslog over UDP, ingestible by Splunk,
+  ELK/Logstash, Graylog, QRadar, etc. out of the box. Zero new dependencies
+  (`std::net::UdpSocket`). `ghostfs siem test` sends a one-off test message.
+- **Dead man's switch** — every 10 minutes, a background thread re-verifies
+  the audit HMAC chain and forensics hash-chain *without* needing anyone to
+  run `ghostfs verify` manually. On violation, the volume is immediately
+  frozen (all I/O returns `EIO`) and a `CRITICAL`/`Emergency` syslog event
+  fires. The freeze flag is deliberately in-memory only, with no live
+  "unfreeze" API — recovery is always: investigate offline with
+  `ghostfs verify` (doesn't need the live mount), then unmount/remount once
+  resolved. This is intentional: a live unfreeze command would let an
+  attacker who already has process-level access simply undo the freeze.
+- **`frozen` now actually covers all mutating FUSE operations** — previously
+  only `read`/`write` checked it; `mkdir`, `rmdir`, `symlink`, `link`,
+  `create`, `rename`, `unlink`, `setattr`, `setxattr`, `removexattr` were
+  silent gaps in what was supposed to be a full I/O quiesce.
+- **Background repair thread was dormant** — it waited forever on a channel
+  nothing ever sent to, so the hourly automatic corruption scan never
+  actually ran. Fixed to self-schedule via `recv_timeout`.
+- **Honeytoken files** (`ghostfs canary mark/unmark/list`) — mark specific
+  inodes as bait; any access triggers an immediate critical IDS alert +
+  syslog event + optional per-file webhook, and feeds straight into
+  `AutoResponse`'s lockout escalation (see v0.4 notes above). Previously
+  this CLI existed but called methods that didn't exist anywhere in
+  `canary.rs` (which only implemented an unrelated periodic HTTPS beacon).
+
+## Ransomware behavior detection (v0.6)
+
+`security/ransomware.rs` — every write is checked (Shannon entropy of the
+raw plaintext GhostFS receives from the client, before its own encryption)
+against a per-UID sliding window (60s). If a UID rewrites ≥15 distinct
+files with ≥75% of those writes looking high-entropy (≥7.5 bits/byte —
+i.e. looking already-encrypted/random, the hallmark of ransomware
+overwriting file contents), the **entire volume is immediately frozen**
+(not just the offending UID) and an `Emergency` syslog event + IDS alert
+fire. This is a behavioral heuristic, not a signature scanner — it can
+false-positive on legitimate bulk writes of already-compressed/encrypted
+data (backup tools, transcoders, database engines with native page
+compression), so known-good UIDs can be exempted:
+
+```
+ghostfs ransomware allow --device /dev/sdX1 --uid 1000
+ghostfs ransomware status --device /dev/sdX1
+ghostfs ransomware disable --device /dev/sdX1   # not recommended
+```
+
+Detection alone doesn't undo damage already written before the threshold
+tripped — that's what `data/versioning.rs` (previous file versions) and
+`ghostfs backup` exist for; this module is one layer of defense-in-depth,
+designed to work alongside them, not replace them.
+
+## Two-person integrity & memory hardening (v0.7)
+
+- **`ghostfs shamir split/combine`** — Shamir's Secret Sharing (GF(256),
+  same field as AES) for the master key. Split a key file into N shares,
+  M of which reconstruct it; fewer than M reveal *zero* information about
+  the key (information-theoretic, not just computationally hard). Standard
+  "two-person rule" / "no single custodian" control for high-security
+  environments. Reconstructed output is a normal `--key-file`, so it drops
+  straight into `mount`, `backup`, `restore`, `tpm-seal-key` unchanged.
+  ```
+  ghostfs shamir split   --key-file key.hex --shares 5 --threshold 3 --output-dir ./shares
+  ghostfs shamir combine --share-files s1.txt,s2.txt,s3.txt --output key.hex
+  ```
+- **Process memory hardening** (`security/memlock.rs`) — `mount`, `keygen`,
+  `tpm-seal-key`, and `shamir combine` now call `mlockall()` (keys never
+  swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)` (no core dumps, no
+  `ptrace` attach by other users, even root without `CAP_SYS_PTRACE`)
+  before any key material is read or derived. Best-effort — missing
+  `CAP_IPC_LOCK`/low `RLIMIT_MEMLOCK` logs a loud warning instead of
+  failing the mount.
+
+## Panic button & live audit streaming (v0.8)
+
+- **`ghostfs lockdown enable/disable/status --device <dev>`** — a true
+  cross-process panic button. Unlike `freeze()` (in-memory, one process),
+  the lockdown flag lives in the shared sled DB: running `ghostfs lockdown
+  enable` from an unrelated CLI invocation takes effect on an *already
+  mounted, already running* volume within its next filesystem operation,
+  and blocks *everyone including root*, with no exceptions. New mount
+  attempts refuse outright while active. Clearing requires an explicit
+  `disable`.
+- **`ghostfs siem stream-audit --on true`** — optionally streams every
+  logged operation (not just security alerts) to the configured SIEM
+  endpoint live, as it happens. Defense against an attacker with root who
+  deletes the local hash-chained audit/forensics log along with the
+  volume — the remote copy already left the building. Opt-in due to
+  per-message thread-spawn overhead at high write throughput (use a local
+  rsyslog/syslog-ng relay for high-volume workloads).
+- **Unencrypted swap warning** — `harden_process()` now also checks
+  `/proc/swaps` and warns (once, at mount/keygen time) if active swap
+  doesn't look encrypted, since `mlockall()` only protects this process's
+  own memory, not swap-based leakage in general.
