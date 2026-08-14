@@ -91,6 +91,15 @@ impl Repair {
     }
 
     pub fn scan_and_repair(&self) -> Result<(), HfsError> {
+        let (scanned, repaired) = self.scan_report()?;
+        log::info!("GhostFS repair: {} scanned, {} repaired", scanned, repaired);
+        Ok(())
+    }
+
+    /// Jak `scan_and_repair`, ale zwraca liczniki zamiast tylko logować —
+    /// używane przez `ghostfs verify` (CLI security self-test) do wypisania
+    /// czytelnego raportu użytkownikowi zamiast grzebania w logach.
+    pub fn scan_report(&self) -> Result<(u64, u64), HfsError> {
         let prefix = "inode:";
         let mut repaired = 0u64;
         let mut scanned  = 0u64;
@@ -104,7 +113,6 @@ impl Repair {
                 }
             }
         }
-        log::info!("GhostFS repair: {} scanned, {} repaired", scanned, repaired);
-        Ok(())
+        Ok((scanned, repaired))
     }
 }
