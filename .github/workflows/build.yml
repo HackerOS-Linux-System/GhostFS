@@ -148,6 +148,56 @@ jobs:
           chmod 755 "$PKGROOT/DEBIAN/postinst" "$PKGROOT/DEBIAN/postrm"
           echo "PKGROOT=$PKGROOT" >> "$GITHUB_ENV"
 
+      - name: Verify packaging tree completeness (fail loudly, not silently)
+        # `cp -r`/`install -D` above never error on a MISSING source file in
+        # a way that fails the job — a stale checkout or accidental deletion
+        # would silently produce an incomplete .deb that only breaks later,
+        # confusingly, in the install-smoke-test job (or worse, on someone's
+        # real machine). Check every file this package's postinst/postrm/
+        # calamares integration actually depends on existing, and fail the
+        # build HERE if any are missing.
+        run: |
+          set -eu
+          MISSING=0
+          check() {
+            if [ ! -e "$PKGROOT/$1" ]; then
+              echo "::error::Missing from packaging tree: $1"
+              MISSING=1
+            fi
+          }
+          check "usr/lib/ghostfs/calamares-patch.py"
+          check "usr/local/bin/ghostfs"
+          check "usr/local/bin/ghostfs-cybersec"
+          check "usr/local/bin/ghostfs-admin.sh"
+          check "sbin/mount.ghostfs"
+          check "etc/initramfs-tools/hooks/ghostfs"
+          check "etc/initramfs-tools/scripts/local-top/ghostfs-mount"
+          check "etc/calamares/modules/ghostfs-mkfs.conf"
+          check "usr/lib/calamares/modules/ghostfs-mkfs/ghostfs_mkfs.py"
+          check "usr/lib/calamares/modules/ghostfs-mount/ghostfs_mount.py"
+          check "usr/lib/calamares/modules/ghostfs-umount/ghostfs_umount.py"
+          check "usr/share/doc/ghostfs/settings.conf.ghostfs"
+          check "usr/share/doc/ghostfs/partition.conf.ghostfs-patch.yaml"
+          check "DEBIAN/postinst"
+          check "DEBIAN/postrm"
+          if [ "$MISSING" = "1" ]; then
+            echo "::error::Packaging tree is incomplete — see missing files above. \
+Refusing to build a .deb that would silently fail its own postinst at install time."
+            exit 1
+          fi
+          echo "✓ packaging tree complete"
+
+      - name: Verify initramfs script is POSIX sh (dash) compatible
+        # update-initramfs runs local-top scripts via /bin/sh (dash on
+        # Debian/Ubuntu) regardless of any #!/usr/bin/env bash shebang, and
+        # also syntax-checks them with `sh -n` at build time. Bash-only
+        # syntax (arrays, [[ ]], read -s) causes a hard failure INSIDE the
+        # initramfs at boot — the worst possible place to discover it. Catch
+        # it here instead, with the exact interpreter that will actually run it.
+        run: |
+          sudo apt-get install -y --no-install-recommends dash
+          dash -n scripts/ghostfs-mount-initramfs
+
       - name: Determine package version
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
