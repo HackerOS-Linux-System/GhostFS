@@ -2,14 +2,21 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use blake3::Hasher;
 use rand::Rng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroize;
 use crate::error::HfsError;
 
 pub type Key = [u8; 32];
 
 const NONCE_SIZE:    usize = 12;
+const NONCE_PREFIX_SIZE: usize = 4;
+const NONCE_COUNTER_SIZE: usize = NONCE_SIZE - NONCE_PREFIX_SIZE; // 8 bytes
 const FEK_CONTEXT:  &[u8] = b"ghostfs-fek-derivation-v1";
 const REKEK_CTX:    &[u8] = b"ghostfs-rekey-wrapping-v1";
+const DIRENC_CTX:   &[u8] = b"ghostfs-dirname-encryption-v1";
+const DIRNAME_BLIND_CTX: &[u8] = b"ghostfs-dirname-blindindex-v1";
+const SIGNING_KEY_CTX: &[u8] = b"ghostfs-forensics-signing-key-v1";
 
 /// AAD = "GFS" || ino (8B LE) || block_idx (8B LE) || volume_uuid (16B)
 /// Wiąże szyfrogram z konkretnym blokiem konkretnego pliku konkretnego wolumenu.
@@ -29,6 +36,17 @@ pub struct Crypto {
     master_cipher: Aes256Gcm,
     /// UUID wolumenu — część AAD, zapobiega cross-volume block swapping.
     pub volume_uuid: [u8; 16],
+    /// Losowy prefiks nonce dla TEJ sesji (mountu) — patrz `next_nonce()`.
+    nonce_prefix:  [u8; NONCE_PREFIX_SIZE],
+    /// Monotonicznie rosnący licznik — razem z `nonce_prefix` daje
+    /// GWARANTOWANĄ (nie tylko "statystycznie mało prawdopodobną") unikalność
+    /// nonce w obrębie sesji, zamiast polegać wyłącznie na 96-bitowej
+    /// losowości (podatnej na paradoks urodzinowy przy ok. 2^48 szyfrowań —
+    /// dla wolumenu zapisującego miliardy bloków w całym cyklu życia to nie
+    /// jest zerowe ryzyko). Współdzielony przez `Arc` między klonami
+    /// `Crypto` tak, by WSZYSTKIE wątki FUSE piszące pod tym samym kluczem
+    /// czerpały z jednego, nigdy nie powtarzającego się licznika.
+    nonce_counter: Arc<AtomicU64>,
 }
 
 impl Crypto {
@@ -36,13 +54,35 @@ impl Crypto {
         let master_cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| HfsError::CryptoError)?;
         let volume_uuid = rand::thread_rng().gen::<[u8; 16]>();
-        Ok(Self { master_key: key, master_cipher, volume_uuid })
+        Ok(Self {
+            master_key: key, master_cipher, volume_uuid,
+            nonce_prefix: rand::thread_rng().gen(),
+            nonce_counter: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn new_with_uuid(key: Key, uuid: [u8; 16]) -> Result<Self, HfsError> {
         let master_cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| HfsError::CryptoError)?;
-        Ok(Self { master_key: key, master_cipher, volume_uuid: uuid })
+        Ok(Self {
+            master_key: key, master_cipher, volume_uuid: uuid,
+            nonce_prefix: rand::thread_rng().gen(),
+            nonce_counter: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Wygeneruj następny nonce dla tej sesji: `nonce_prefix (4B losowe przy
+    /// starcie mountu) || counter (8B, atomowo rosnący)`. Gwarantuje brak
+    /// powtórzeń nonce w obrębie jednej sesji niezależnie od liczby
+    /// zaszyfrowanych bloków (counter zawija się dopiero po 2^64 operacjach —
+    /// praktycznie nieosiągalne), w przeciwieństwie do czysto losowego
+    /// 96-bitowego nonce, który polega wyłącznie na statystyce.
+    fn next_nonce(&self) -> [u8; NONCE_SIZE] {
+        let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+        let mut out = [0u8; NONCE_SIZE];
+        out[..NONCE_PREFIX_SIZE].copy_from_slice(&self.nonce_prefix);
+        out[NONCE_PREFIX_SIZE..].copy_from_slice(&n.to_be_bytes()[..NONCE_COUNTER_SIZE]);
+        out
     }
 
     /// Per-inode File Encryption Key: FEK = BLAKE3-KDF(master, ino || volume_uuid)
@@ -50,6 +90,48 @@ impl Crypto {
         let mut h = Hasher::new_keyed(&self.master_key);
         h.update(FEK_CONTEXT);
         h.update(&ino.to_le_bytes());
+        h.update(&self.volume_uuid);
+        *h.finalize().as_bytes()
+    }
+
+    /// Klucz szyfrujący NAZWY plików w danym katalogu (`parent_ino`). Osobny
+    /// kontekst od FEK, żeby kompromitacja jednego nie ujawniała drugiego.
+    /// Patrz `fs/dirindex.rs` — bez tego nazwy plików leżały w superblokcie
+    /// db KOMPLETNIE jawnym tekstem (base64 to nie szyfrowanie).
+    pub fn derive_dir_enc_key(&self, parent_ino: u64) -> Key {
+        let mut h = Hasher::new_keyed(&self.master_key);
+        h.update(DIRENC_CTX);
+        h.update(&parent_ino.to_le_bytes());
+        h.update(&self.volume_uuid);
+        *h.finalize().as_bytes()
+    }
+
+    /// Blind index (jednokierunkowy, deterministyczny skrót) do wyszukiwania
+    /// wpisów katalogu PO NAZWIE bez potrzeby ich odszyfrowywania —
+    /// odpowiednik "searchable encryption" w najprostszej, ale bezpiecznej
+    /// formie: skrót jest kluczowany master_key, więc atakujący bez klucza
+    /// NIE MOŻE zbudować tęczowej tablicy typowych nazw plików
+    /// ("id_rsa", "passwords.txt", ...) i porównać jej z indeksem —
+    /// w przeciwieństwie do niekluczowanego `blake3::hash(name)`, które
+    /// wcześniej było używane i było podatne dokładnie na taki atak
+    /// słownikowy (sam hash bez klucza to nie jest ochrona poufności).
+    pub fn dirname_blind_index(&self, parent_ino: u64, name: &[u8]) -> [u8; 32] {
+        let mut ctx_hasher = Hasher::new_keyed(&self.master_key);
+        ctx_hasher.update(DIRNAME_BLIND_CTX);
+        ctx_hasher.update(&parent_ino.to_le_bytes());
+        ctx_hasher.update(&self.volume_uuid);
+        let subkey = *ctx_hasher.finalize().as_bytes();
+        let mut h = Hasher::new_keyed(&subkey);
+        h.update(name);
+        *h.finalize().as_bytes()
+    }
+
+    /// Klucz do szyfrowania klucza podpisującego Ed25519 dla forensics
+    /// (patrz `security/signing.rs`) — osobny kontekst od FEK/dirname, tak
+    /// by kompromitacja jednego nie ujawniała pozostałych.
+    pub fn derive_signing_key(&self) -> Key {
+        let mut h = Hasher::new_keyed(&self.master_key);
+        h.update(SIGNING_KEY_CTX);
         h.update(&self.volume_uuid);
         *h.finalize().as_bytes()
     }
@@ -64,7 +146,7 @@ impl Crypto {
         block_idx: usize,
     ) -> Result<Vec<u8>, HfsError> {
         let cipher      = Aes256Gcm::new_from_slice(fek).map_err(|_| HfsError::CryptoError)?;
-        let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
+        let nonce_bytes = self.next_nonce();
         let nonce       = Nonce::from_slice(&nonce_bytes);
         let aad         = make_aad(ino, block_idx as u64, &self.volume_uuid);
         let ciphertext  = cipher.encrypt(nonce, Payload { msg: plaintext, aad: &aad })
@@ -102,7 +184,7 @@ impl Crypto {
 
     pub fn encrypt_with_key(&self, fek: &Key, plaintext: &[u8]) -> Result<Vec<u8>, HfsError> {
         let cipher = Aes256Gcm::new_from_slice(fek).map_err(|_| HfsError::CryptoError)?;
-        let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
+        let nonce_bytes = self.next_nonce();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher.encrypt(nonce, Payload { msg: plaintext, aad: b"ghostfs-meta" })
             .map_err(|_| HfsError::CryptoError)?;
