@@ -2,6 +2,8 @@
 #[path = "../core/serialization.rs"]    pub mod serialization;
 #[path = "../core/cache.rs"]            pub mod cache;
 #[path = "../core/journal.rs"]          pub mod journal;
+#[path = "../core/prefetch.rs"]         pub mod prefetch;
+#[path = "../data/backup.rs"]           pub mod backup;
 #[path = "fs.rs"]                       pub mod fs;
 #[path = "extents.rs"]                  pub mod extents;
 #[path = "dirindex.rs"]                 pub mod dirindex;
@@ -24,6 +26,13 @@
 #[path = "../security/canary.rs"]       pub mod canary;
 #[path = "../security/tpm.rs"]          pub mod tpm;
 #[path = "../security/grpc_forensics.rs"]pub mod grpc_forensics;
+#[path = "../security/response.rs"]     pub mod response;
+#[path = "../security/worm.rs"]         pub mod worm;
+#[path = "../security/signing.rs"]      pub mod signing;
+#[path = "../security/syslog.rs"]       pub mod syslog;
+#[path = "../security/ransomware.rs"]   pub mod ransomware;
+#[path = "../security/shamir.rs"]       pub mod shamir;
+#[path = "../security/memlock.rs"]      pub mod memlock;
 
 pub use error::HfsError;
 pub use crypto::Key;
@@ -55,8 +64,13 @@ use crate::ids::Ids;
 use crate::forensics::Forensics;
 use crate::secure_delete::SecureDelete;
 use crate::rate_limit::RateLimiter;
+use crate::response::{AutoResponse, ResponseAction};
+use crate::worm::Worm;
+use crate::ransomware::RansomwareGuard;
+use crate::syslog::SyslogSender;
 use crate::superblock::Superblock;
 use crate::canary::Canary;
+use crate::prefetch::Prefetcher;
 
 pub const FS_BLOCK_SIZE: u32 = 4096;
 pub const ROOT_INO: u64      = 1;
@@ -76,6 +90,18 @@ pub struct GhostFS {
     pub         rate_limit: RateLimiter,
     /// fsfreeze flag — gdy true wszystkie I/O zwracają EIO
     pub(crate) frozen:      Arc<AtomicBool>,
+    /// Automatyczna reakcja na powtarzające się alerty IDS (warn → lockout).
+    pub(crate) auto_response: AutoResponse,
+    /// WORM/immutable — patrz `security/worm.rs`.
+    pub(crate) worm: Worm,
+    /// Behawioralna detekcja ransomware (entropia + tempo zapisów) —
+    /// patrz `security/ransomware.rs`.
+    pub(crate) ransomware_guard: RansomwareGuard,
+    /// SIEM (syslog) — używane bezpośrednio tu tylko do opcjonalnego
+    /// strumieniowania pełnego audytu (patrz `log_audit`); alerty
+    /// bezpieczeństwa (IDS lockout, canary, ransomware) mają WŁASNE
+    /// instancje wewnątrz odpowiednich modułów.
+    pub(crate) syslog: SyslogSender,
     // Core
     pub(crate) compression: Compression,
     pub(crate) dedup:       Deduplication,
@@ -90,6 +116,8 @@ pub struct GhostFS {
     pub(crate) extents:     ExtentTree,
     pub(crate) dirindex:    DirIndex,
     pub(crate) noatime:     bool,
+    /// Równoległy odczyt wyprzedzający dla sekwencyjnych wzorców dostępu.
+    pub(crate) prefetcher:  Prefetcher,
     #[allow(dead_code)]
     pub(crate) background_repair_sender: Option<Sender<()>>,
 }
@@ -104,7 +132,41 @@ impl GhostFS {
         let db = sled::open(db_path)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
-        let crypto = Crypto::new(key)?;
+        // ── Fail-closed superblock verification ─────────────────────────────
+        // Wcześniej: żadna weryfikacja hasła/klucza przy mouncie — błędne
+        // hasło "montowało się" bez błędu i dopiero pierwszy odczyt bloku
+        // kończył się AEAD auth failure (myląca diagnostyka, i co gorsza:
+        // operacje METADANYCH — readdir, getattr — działałyby normalnie na
+        // NIEZASZYFROWANYCH inode'ach, dając fałszywe poczucie że mount się
+        // udał). Teraz: jeśli superblock istnieje, MUSI zweryfikować HMAC
+        // pod podanym kluczem, inaczej odmawiamy mountu od razu.
+        //
+        // `volume_uuid` jest też odczytywany stąd (patrz superblock.rs) —
+        // NIE generowany losowo per-mount jak wcześniej, co gwarantuje że
+        // dane zapisane w poprzedniej sesji nadal się odszyfrują.
+        let volume_uuid = match db.get(b"sb:data")? {
+            Some(_) => {
+                let sb = Superblock::load_and_verify(&db, &key)
+                    .context("Superblock HMAC verification failed — wrong passphrase/key-file, \
+                              or the volume metadata has been tampered with. Refusing to mount.")?;
+                sb.data.volume_uuid
+            }
+            None => {
+                // Brak superblocka — wolumin utworzony bez `ghostfs mkfs` (np.
+                // testowa baza sled) lub bardzo stary format. Nie blokujemy
+                // mountu (backward-compat), ale losowy UUID oznacza że dane
+                // zapisane w TEJ sesji nie przetrwają kolejnego mountu bez
+                // superblocka — logujemy to głośno.
+                log::warn!(
+                    "GhostFS: no superblock found at {} — mounting WITHOUT verified volume_uuid. \
+                     Run 'ghostfs mkfs' to create a proper superblock; data written this session \
+                     will not survive a remount without one.", db_path.display()
+                );
+                rand::random()
+            }
+        };
+
+        let crypto = Crypto::new_with_uuid(key, volume_uuid)?;
 
         let compression = Compression::new(match compression_type.as_deref() {
             Some("zlib") => CompressionType::Zlib,
@@ -123,7 +185,7 @@ impl GhostFS {
         let xattr      = XAttr::new(&db)?;
         let journal    = Journal::new(&db)?;
         let extents    = ExtentTree::new(&db)?;
-        let dirindex   = DirIndex::new(&db)?;
+        let dirindex   = DirIndex::new(&db, crypto.clone())?;
         let integrity  = IntegrityTree::new(&db)?;
         let mac        = MacLabels::new(&db)?;
         let ids        = Ids::new(&db)?;
@@ -131,8 +193,26 @@ impl GhostFS {
         let secure_del = SecureDelete::new(&db)?;
         let canary     = Canary::new(&db, &ids)?;
         let rate_limit = RateLimiter::new();
+        let auto_response = AutoResponse::new(&db)?;
+        if let Some(reason) = auto_response.is_global_lockdown()? {
+            return Err(HfsError::VolumeLockedDown(reason)).context(
+                "Volume is under manual lockdown — refusing to mount. \
+                 Clear with 'ghostfs lockdown disable --device <dev>' once the incident is resolved."
+            );
+        }
+        let worm = Worm::new(&db)?;
+        let ransomware_guard = RansomwareGuard::new(&db, &ids)?;
+        let syslog = SyslogSender::new(&db)?;
+        // Odtwórz stan lockoutów z DB — `RateLimiter::lockout` żyje tylko
+        // w pamięci (per-mount), więc bez tego restart mountu resetowałby
+        // cichcem wszystkie aktywne blokady UID nałożone przez poprzednią sesję.
+        for (uid, locked_at) in auto_response.list_locked()? {
+            rate_limit.lock_uid(uid);
+            log::warn!("GhostFS: restored lockout for uid={} (locked at ts={})", uid, locked_at);
+        }
         let repair     = Repair::new(&db, &Some(crypto.clone()), &compression, &dedup, &versioning)?;
         let cache      = Cache::new();
+        let prefetcher = Prefetcher::new();
         let frozen     = Arc::new(AtomicBool::new(false));
 
         let next_ino = match db.get(b"next_ino")? {
@@ -160,10 +240,71 @@ impl GhostFS {
         let (tx, rx) = crossbeam::channel::unbounded::<()>();
         let repair_clone = repair.clone();
         std::thread::spawn(move || {
-            while let Ok(()) = rx.recv() {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
+            loop {
+                // `recv_timeout` zamiast `recv()` — poprzednio wątek czekał
+                // NA ZAWSZE na sygnał z `tx`, którego nikt nigdy nie wysyłał
+                // (background_repair_sender był tworzony, ale nigdzie w
+                // kodzie nie wołano `.send(())`), więc automatyczna naprawa
+                // w tle faktycznie NIGDY się nie uruchamiała. Teraz: odpala
+                // się co godzinę samoistnie, a `tx` wciąż pozwala na
+                // wcześniejsze, manualne wybudzenie (np. przyszłe
+                // `ghostfs repair now` przez kanał administracyjny).
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(3600));
                 if let Err(e) = repair_clone.scan_and_repair() {
                     log::error!("Background repair failed: {}", e);
+                }
+            }
+        });
+
+        // ── Dead man's switch ────────────────────────────────────────────
+        // Okresowo (domyślnie co 10 minut) weryfikuje w tle łańcuchy HMAC
+        // audytu i hash-chain forensics BEZ czekania na `ghostfs verify`
+        // uruchomiony ręcznie. Jeśli którykolwiek jest naruszony —
+        // NATYCHMIAST zamraża wolumin (`freeze()`, ten sam mechanizm co
+        // ręczny "live forensics snapshot") i wysyła krytyczny alert do
+        // SIEM. Zamrożenie jest świadomie agresywne: skoro ktoś potrafił
+        // zmanipulować hash-chain (co samo w sobie wymaga dostępu do
+        // wewnętrznych struktur DB, nie tylko FUSE), dalsza praca na
+        // wolumenie może zacierać ślady lub pogłębiać szkodę — bezpieczniej
+        // zatrzymać I/O i zmusić administratora do świadomej decyzji
+        // (offline `ghostfs verify` + świadomy remount) niż działać dalej.
+        // `frozen` żyje tylko w pamięci TEGO procesu (nie w DB) — nie ma
+        // API "unfreeze na żywo"; recovery to zawsze: zbadaj offline, potem
+        // odmontuj/zamontuj ponownie. To celowe — brak żywego "unfreeze"
+        // wyklucza scenariusz, w którym atakujący z dostępem do tego samego
+        // procesu po prostu cofa zamrożenie.
+        let dms_forensics = forensics.clone();
+        let dms_audit     = audit.clone();
+        let dms_frozen    = frozen.clone();
+        let dms_syslog    = crate::syslog::SyslogSender::new(&db)?;
+        std::thread::spawn(move || {
+            const CHECK_INTERVAL_SECS: u64 = 600;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS));
+                if dms_frozen.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue; // już zamrożone (ręcznie lub przez wcześniejszą detekcję)
+                }
+                let audit_ok     = dms_audit.verify_signatures().is_ok();
+                let forensics_ok = dms_forensics.verify_chain().is_ok();
+                if !audit_ok || !forensics_ok {
+                    log::error!(
+                        "GhostFS DEAD MAN'S SWITCH: integrity violation detected \
+                         (audit_ok={}, forensics_ok={}) — FREEZING volume (read/write and all \
+                         mutating operations now return EIO). This flag lives only in this \
+                         mount's memory — to recover: 1) investigate offline with \
+                         'ghostfs verify --device <dev>' (safe, does not need this mount), \
+                         2) if the cause is understood/resolved, unmount and remount \
+                         (a fresh mount starts unfrozen). There is no live 'unfreeze' command \
+                         by design — resuming I/O on a volume with an unresolved chain \
+                         violation without a deliberate remount is exactly what this switch \
+                         exists to prevent.",
+                        audit_ok, forensics_ok
+                    );
+                    dms_syslog.send(
+                        crate::syslog::Severity::Emergency, "CHAIN_VIOLATION",
+                        &format!("volume auto-frozen: audit_ok={} forensics_ok={}", audit_ok, forensics_ok),
+                    );
+                    dms_frozen.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         });
@@ -173,8 +314,9 @@ impl GhostFS {
         Ok(Self {
             db, next_ino: AtomicU64::new(next_ino),
             crypto, integrity, mac, ids, forensics, secure_del, canary, rate_limit, frozen,
+            auto_response, worm, ransomware_guard, syslog,
             compression, dedup, versioning, audit, quota, xattr,
-            repair, cache, noatime,
+            repair, cache, noatime, prefetcher,
             background_repair_sender: Some(tx),
             journal, extents, dirindex,
         })
@@ -242,6 +384,14 @@ impl GhostFS {
         self.dedup.verify(ino, block_idx, &decompressed)?;
         self.integrity.verify_block(ino, block_idx, &decompressed)?;
         self.cache.put_block(ino, block_idx, decompressed.clone());
+
+        // Sekwencyjny wzorzec? Zleć odczyt kolejnych bloków w tle (rayon).
+        // Non-blocking — nie opóźnia odpowiedzi na bieżące żądanie FUSE.
+        self.prefetcher.on_block_read(
+            ino, block_idx, &self.db, &self.crypto, &self.compression,
+            &self.dedup, &self.integrity, &self.extents, &self.cache,
+        );
+
         Ok(decompressed)
     }
 
@@ -254,7 +404,9 @@ impl GhostFS {
         let compressed = self.compression.compress(data)?;
         let encrypted  = self.crypto.encrypt_with_key(&fek, &compressed)?;
         let key        = format!("data:{}:{}", ino, block_idx);
-        self.journal.log_write(ino, block_idx, &self.db.get(key.as_bytes())?.map(|v| v.to_vec()))?;
+        let before     = self.db.get(key.as_bytes())?.map(|v| v.to_vec());
+        let after      = Some(encrypted.clone());
+        self.journal.log_write(ino, block_idx, &before, &after)?;
         self.db.insert(key.as_bytes(), encrypted)?;
         self.dedup.insert_hash(ino, block_idx, data)?;
         self.extents.record(ino, block_idx, &key)?;
@@ -342,19 +494,70 @@ impl GhostFS {
     }
 
     pub(crate) fn check_permission(&mut self, ino: u64, uid: u32, gid: u32, access_mask: i32) -> Result<bool, HfsError> {
+        // Globalny lockdown — sprawdzane JAKO PIERWSZE, przed wszystkim
+        // innym (nawet przed per-UID lockoutem). Blokuje WSZYSTKICH,
+        // łącznie z rootem, bez wyjątku — to "przycisk paniki", nie
+        // zwykła kontrola dostępu. Patrz `AutoResponse::enable_global_lockdown`.
+        if let Some(reason) = self.auto_response.is_global_lockdown()? {
+            return Err(HfsError::VolumeLockedDown(reason));
+        }
+
+        // Fail-closed: UID zablokowany przez AutoResponse -> odmowa
+        // WSZYSTKIEGO, sprawdzane przed jakąkolwiek inną logiką (MAC/DAC).
+        if self.auto_response.is_locked(uid)? {
+            return Err(HfsError::UidLockedOut(uid));
+        }
+
         let inode  = self.get_inode(ino)?.ok_or(HfsError::NoEntry)?;
+
+        // Honeytoken check — samo DOTKNIĘCIE oznaczonego inode jest
+        // sygnałem intruzji, niezależnie od tego czy MAC/DAC poniżej i tak
+        // odrzucą operację. Wołane dla WSZYSTKICH uid (w tym root — patrz
+        // `AutoResponse::evaluate`, które celowo nigdy nie blokuje uid=0,
+        // ale wciąż loguje/alertuje). Zwrócone `true` wymusza natychmiastową
+        // ewaluację auto-response PONIŻEJ zamiast czekać na osobną anomalię
+        // z `record_access` — honeytoken nie ma żadnego uzasadnienia
+        // dostępu, więc nie ma powodu czekać.
+        let canary_hit = self.canary.trigger(ino, uid, access_mask)?;
+
         let mac_ok = self.mac.check_ct(ino, uid, gid, access_mask)?;
-        self.ids.record_access(uid, ino, access_mask)?;
+        let mut anomalous = self.ids.record_access(uid, ino, access_mask)? || canary_hit;
+
         let mode   = inode.attr.perm;
         let dac_ok = if uid == 0                  { true }
             else if uid == inode.attr.uid          { (mode as i32 & access_mask) == access_mask }
             else if gid == inode.attr.gid          { ((mode >> 3) as i32 & access_mask) == access_mask }
             else                                   { ((mode >> 6) as i32 & access_mask) == access_mask };
+
+        // Odmowa MAC to sygnał bezpieczeństwa, nie tylko "brak uprawnień" —
+        // ktoś próbował odczytać/zapisać dane spoza swojej klauzuli. Wcześniej
+        // to ginęło w `log::debug!` wewnątrz mac.rs bez zasilania IDS.
+        if !mac_ok {
+            self.ids.add_alert(uid, ino, "MAC policy violation (Bell-LaPadula deny)", access_mask)?;
+            anomalous = true;
+        }
+
+        if anomalous {
+            if self.auto_response.evaluate(&self.ids, &self.rate_limit, uid)? == ResponseAction::LockedOut {
+                return Err(HfsError::UidLockedOut(uid));
+            }
+        }
+
         Ok(mac_ok & dac_ok)
     }
 
     pub(crate) fn check_quota(&self, uid: u32, additional: u64) -> Result<(), HfsError> {
         self.quota.check_quota(uid, additional)
+    }
+
+    /// Odmawia operacji jeśli inode jest pod ochroną WORM/immutable —
+    /// wołane na początku write/truncate/unlink/rename(source)/rmdir
+    /// (przez wpis katalogu) w `fs.rs`. Patrz `security/worm.rs`.
+    pub(crate) fn ensure_not_worm_locked(&self, ino: u64) -> Result<(), HfsError> {
+        if self.worm.is_locked(ino)? {
+            return Err(HfsError::WormLocked(ino));
+        }
+        Ok(())
     }
 
     pub(crate) fn update_quota(&self, uid: u32, delta: u64) -> Result<(), HfsError> {
@@ -364,6 +567,15 @@ impl GhostFS {
     pub(crate) fn log_audit(&self, uid: u32, op: &str, ino: u64, name: Option<&OsStr>) -> Result<(), HfsError> {
         self.audit.log(uid, op, ino, name)?;
         self.forensics.record(uid, op, ino, name)?;
+        // Strumieniowanie na żywo do SIEM — opt-in, patrz
+        // `SyslogSender::set_stream_audit` dla uzasadnienia i kompromisów.
+        if self.syslog.stream_audit_enabled() {
+            let name_str = name.map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.syslog.send(
+                crate::syslog::Severity::Info, "AUDIT",
+                &format!("uid={} op={} ino={} name={}", uid, op, ino, name_str),
+            );
+        }
         Ok(())
     }
 
@@ -398,8 +610,10 @@ pub fn format(db_path: &Path, master_key: &Key, kdf_params: crate::kdf::KdfParam
         format!("inode:{}", ROOT_INO).as_bytes(),
         bincode::serialize(&serialization::Inode { attr: root_attr.into(), parent: 0 })?,
     );
-    // Superblock zawiera KDF params — kluczowe dla round-trip mount
-    let sb = Superblock::new(bs, master_key, kdf_params)?;
+    // Superblock zawiera KDF params i volume_uuid — kluczowe dla round-trip mount.
+    // volume_uuid generowany RAZ tutaj i persystowany (patrz superblock.rs doc).
+    let volume_uuid: [u8; 16] = rand::random();
+    let sb = Superblock::new(bs, master_key, kdf_params, volume_uuid)?;
     batch.insert(b"sb:data", bincode::serialize(&sb)?);
     db.apply_batch(batch)?;
     db.flush()?;
