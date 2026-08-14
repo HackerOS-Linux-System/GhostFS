@@ -16,6 +16,17 @@ pub struct SuperblockData {
     /// KDF params zapisywane przy mkfs, odczytywane przy mount
     pub kdf_params: KdfParams,
     pub flags:      u64,
+    /// UUID wolumenu — część AAD każdego zaszyfrowanego bloku (patrz
+    /// `crypto::make_aad`). MUSI być persystowany i identyczny na każdym
+    /// mouncie: `security::crypto::Crypto` wcześniej losował świeże UUID
+    /// przy każdym `Crypto::new()`, co oznaczało że dane zapisane w
+    /// mouncie A stawały się nieodszyfrowywalne w mouncie B (AAD mismatch
+    /// -> AEAD auth failure). Przechowanie go tutaj — chronionego tym samym
+    /// HMAC co reszta superblocka — naprawia to i jednocześnie sprawia, że
+    /// próba podmiany volume_uuid przez atakującego (np. by pomieszać
+    /// bloki między wolumenami) jest wykrywana jak każda inna manipulacja
+    /// superblockiem.
+    pub volume_uuid: [u8; 16],
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -26,7 +37,7 @@ pub struct Superblock {
 
 impl Superblock {
     /// Tworzy nowy superblock z KDF params. Wywołać po derive_key przy mkfs.
-    pub fn new(block_size: u32, master_key: &Key, kdf_params: KdfParams) -> Result<Self, HfsError> {
+    pub fn new(block_size: u32, master_key: &Key, kdf_params: KdfParams, volume_uuid: [u8; 16]) -> Result<Self, HfsError> {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs();
@@ -36,6 +47,7 @@ impl Superblock {
             created_at,
             kdf_params,
             flags: 0x01, // encryption enabled
+            volume_uuid,
         };
         let hmac = Self::compute_hmac(&data, master_key)?;
         Ok(Superblock { data, hmac })
