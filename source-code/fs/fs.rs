@@ -1,5 +1,5 @@
 use crate::*;
-use crate::{mac, ids};
+use crate::{mac, worm};
 use fuser::{
     Filesystem, Request, ReplyAttr, ReplyEntry, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyOpen, ReplyWrite, ReplyXattr, ReplyCreate, ReplyStatfs, ReplyLseek,
@@ -50,8 +50,15 @@ impl Filesystem for GhostFS {
         _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr,
     ) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if req.uid() != 0 && req.uid() != inode.attr.uid { reply.error(EACCES); return; }
+        // WORM: mode/uid/gid/size to zmiany "treści" chronione przez lock —
+        // aktualizacja samego atime/mtime (np. `touch`) jest dozwolona nawet
+        // na zablokowanym pliku, tak jak przy klasycznym `chattr +i`.
+        if mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() {
+            if let Err(e) = self.ensure_not_worm_locked(ino) { reply.error(e.into()); return; }
+        }
         let mut attr: fuser::FileAttr = inode.attr.into();
         if let Some(m) = mode { attr.perm = m as u16; }
         if let Some(u) = uid  { attr.uid  = u; }
@@ -101,6 +108,7 @@ impl Filesystem for GhostFS {
     }
 
     fn mkdir(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
         let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
         let now  = SystemTime::now();
@@ -124,9 +132,11 @@ impl Filesystem for GhostFS {
     }
 
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let ino = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if fuser::FileType::from(inode.attr.kind) == fuser::FileType::Directory { reply.error(EISDIR); return; }
+        if let Err(e) = self.ensure_not_worm_locked(ino) { reply.error(e.into()); return; }
         if let Err(e) = self.check_permission(parent, req.uid(), req.gid(), libc::W_OK) { reply.error(e.into()); return; }
         self.ids.record_access(req.uid(), ino, libc::W_OK).ok();
 
@@ -183,6 +193,7 @@ impl Filesystem for GhostFS {
     }
 
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let ino   = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if inode.attr.kind != fuser::FileType::Directory.into() { reply.error(ENOTDIR); return; }
@@ -203,6 +214,7 @@ impl Filesystem for GhostFS {
     }
 
     fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &std::path::Path, reply: ReplyEntry) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
         let ino    = self.next_ino.fetch_add(1, Ordering::SeqCst);
         let now    = SystemTime::now();
@@ -240,6 +252,7 @@ impl Filesystem for GhostFS {
     }
 
     fn link(&mut self, req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         if self.lookup_name(newparent, newname).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
         let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if fuser::FileType::from(inode.attr.kind) == fuser::FileType::Directory { reply.error(EISDIR); return; }
@@ -258,8 +271,13 @@ impl Filesystem for GhostFS {
     }
 
     fn rename(&mut self, req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let ino = match self.lookup_name(parent, name) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let mut inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
+        // WORM: rename == "move away and let something else take the name",
+        // które dla compliance-retencji jest równoznaczne z usunięciem —
+        // blokujemy tak samo jak unlink.
+        if let Err(e) = self.ensure_not_worm_locked(ino) { reply.error(e.into()); return; }
         if let Ok(Some(tino)) = self.lookup_name(newparent, newname) {
             if let Ok(Some(t)) = self.get_inode(tino) {
                 if fuser::FileType::from(t.attr.kind) == fuser::FileType::Directory
@@ -320,15 +338,22 @@ impl Filesystem for GhostFS {
 
     fn write(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, data: &[u8], _wf: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
         if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
+        if let Err(e) = self.ensure_not_worm_locked(ino) { reply.error(e.into()); return; }
         match self.check_permission(ino, req.uid(), req.gid(), libc::W_OK) {
             Ok(true)  => {}
             Ok(false) => { self.ids.record_access(req.uid(), ino, libc::W_OK).ok(); reply.error(EACCES); return; }
-            Err(_)    => { reply.error(ENOENT); return; }
+            Err(e)    => { reply.error(e.into()); return; }
         }
         if let Err(e) = self.rate_limit.check_io(req.uid(), data.len() as u64) { reply.error(e.into()); return; }
         let uid = req.uid();
         if let Err(e) = self.check_quota(uid, data.len() as u64) { reply.error(e.into()); return; }
         if let Err(e) = self.create_version(ino) { reply.error(e.into()); return; }
+        // Ransomware guard — analiza entropii PRZED zapisem. Jeśli
+        // wyzwoliło (freeze), i tak kontynuujemy TEN JEDEN zapis (już
+        // trwający, dane już przyjęte od klienta) — kolejne operacje
+        // zobaczą już `self.frozen == true` i zostaną odrzucone przez
+        // check na początku tej funkcji.
+        self.ransomware_guard.on_write(uid, ino, data, &self.frozen);
         match self.write_data(ino, offset, data) {
             Ok(written) => {
                 if let Ok(Some(mut inode)) = self.get_inode(ino) {
@@ -357,6 +382,7 @@ impl Filesystem for GhostFS {
     }
 
     fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         if self.lookup_name(parent, name).unwrap_or(None).is_some() { reply.error(EEXIST); return; }
         let ino  = self.next_ino.fetch_add(1, Ordering::SeqCst);
         let now  = SystemTime::now();
@@ -379,7 +405,7 @@ impl Filesystem for GhostFS {
         reply.created(&TTL, &attr, 0, 0, flags as u32);
     }
 
-    fn readdir(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         let parent_ino = if inode.parent == 0 { ino } else { inode.parent };
         let mut entries: Vec<(u64, fuser::FileType, OsString)> = vec![
@@ -402,6 +428,22 @@ impl Filesystem for GhostFS {
             else { reply.error(ERANGE); }
             return;
         }
+        if name.to_string_lossy() == worm::XATTR_LOCK {
+            let state = self.worm.get(ino).unwrap_or_default();
+            let value = if state.immutable { b"1".to_vec() } else { b"0".to_vec() };
+            if size == 0 { reply.size(value.len() as u32); }
+            else if size >= value.len() as u32 { reply.data(&value); }
+            else { reply.error(ERANGE); }
+            return;
+        }
+        if name.to_string_lossy() == worm::XATTR_RETAIN_UNTIL {
+            let state = self.worm.get(ino).unwrap_or_default();
+            let value = state.retention_until.to_string().into_bytes();
+            if size == 0 { reply.size(value.len() as u32); }
+            else if size >= value.len() as u32 { reply.data(&value); }
+            else { reply.error(ERANGE); }
+            return;
+        }
         match self.xattr.get(ino, name) {
             Ok(Some(v)) => { if size == 0 { reply.size(v.len() as u32); } else if size >= v.len() as u32 { reply.data(&v); } else { reply.error(ERANGE); } }
             Ok(None)    => reply.error(ENODATA),
@@ -410,11 +452,39 @@ impl Filesystem for GhostFS {
     }
 
     fn setxattr(&mut self, req: &Request, ino: u64, name: &OsStr, value: &[u8], _flags: i32, _pos: u32, reply: ReplyEmpty) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if req.uid() != 0 && req.uid() != inode.attr.uid { reply.error(EACCES); return; }
         if name.to_string_lossy() == mac::XATTR_LABEL {
             match self.mac.handle_setxattr_label(ino, value) {
                 Ok(()) => { self.log_audit(req.uid(), "setxattr:mac_label", ino, Some(name)).ok(); reply.ok(); }
+                Err(e) => reply.error(e.into()),
+            }
+            return;
+        }
+        if name.to_string_lossy() == worm::XATTR_LOCK {
+            let is_root = req.uid() == 0;
+            let want = matches!(value, b"1" | b"true");
+            match self.worm.set_immutable(ino, want, is_root) {
+                Ok(()) => {
+                    self.log_audit(req.uid(), if want { "worm:lock" } else { "worm:unlock" }, ino, Some(name)).ok();
+                    reply.ok();
+                }
+                Err(e) => reply.error(e.into()),
+            }
+            return;
+        }
+        if name.to_string_lossy() == worm::XATTR_RETAIN_UNTIL {
+            let is_root = req.uid() == 0;
+            let until: u64 = match std::str::from_utf8(value).ok().and_then(|s| s.trim().parse().ok()) {
+                Some(u) => u,
+                None    => { reply.error(libc::EINVAL); return; }
+            };
+            match self.worm.extend_retention(ino, until, is_root) {
+                Ok(()) => {
+                    self.log_audit(req.uid(), "worm:retain_until", ino, Some(name)).ok();
+                    reply.ok();
+                }
                 Err(e) => reply.error(e.into()),
             }
             return;
@@ -428,6 +498,8 @@ impl Filesystem for GhostFS {
             Ok(names) => {
                 let mut data = Vec::new();
                 data.extend_from_slice(mac::XATTR_LABEL.as_bytes()); data.push(0);
+                data.extend_from_slice(worm::XATTR_LOCK.as_bytes()); data.push(0);
+                data.extend_from_slice(worm::XATTR_RETAIN_UNTIL.as_bytes()); data.push(0);
                 for n in names { data.extend_from_slice(n.as_encoded_bytes()); data.push(0); }
                 if size == 0 { reply.size(data.len() as u32); }
                 else if size >= data.len() as u32 { reply.data(&data); }
@@ -438,6 +510,7 @@ impl Filesystem for GhostFS {
     }
 
     fn removexattr(&mut self, req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        if self.frozen.load(Ordering::SeqCst) { reply.error(EIO); return; }
         let inode = match self.get_inode(ino) { Ok(Some(i)) => i, _ => { reply.error(ENOENT); return; } };
         if req.uid() != 0 && req.uid() != inode.attr.uid { reply.error(EACCES); return; }
         if self.xattr.remove(ino, name).is_err() { reply.error(EIO); } else { reply.ok(); }
@@ -497,11 +570,10 @@ impl Filesystem for GhostFS {
             if self.db.get(bkey.as_bytes()).unwrap_or(None).is_none() {
                 // Zapisz pusty blok jako znacznik alokacji.
                 let zero_block = vec![0u8; FS_BLOCK_SIZE as usize];
-                if let Ok(fek) = Ok(self.crypto.derive_fek(ino)) {
-                    if let Ok(compressed) = self.compression.compress(&zero_block) {
-                        if let Ok(encrypted) = self.crypto.encrypt_with_key(&fek, &compressed) {
-                            self.db.insert(bkey.as_bytes(), encrypted).ok();
-                        }
+                let fek = self.crypto.derive_fek(ino);
+                if let Ok(compressed) = self.compression.compress(&zero_block) {
+                    if let Ok(encrypted) = self.crypto.encrypt_with_key(&fek, &compressed) {
+                        self.db.insert(bkey.as_bytes(), encrypted).ok();
                     }
                 }
             }
@@ -544,40 +616,39 @@ impl Filesystem for GhostFS {
                 // Znajdź następny blok z danymi od `offset`.
                 let start_block = (offset as u64 / FS_BLOCK_SIZE as u64) as usize;
                 let max_block   = ((file_size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize;
-                let mut found   = false;
                 for bi in start_block..max_block {
                     let bkey = format!("data:{}:{}", ino, bi);
                     if self.db.get(bkey.as_bytes()).unwrap_or(None).is_some() {
                         let data_offset = (bi as u64 * FS_BLOCK_SIZE as u64).max(offset as u64);
+                        // `return` (nie `break`) — inaczej borrow checker widzi
+                        // dwie ścieżki schodzące się PO pętli (via break z
+                        // przeniesionym `reply` vs. normalne zakończenie pętli
+                        // bez przeniesienia) i konserwatywnie odmawia
+                        // późniejszego użycia `reply` na którejkolwiek z nich
+                        // (E0382). `return` kończy funkcję od razu na tej
+                        // gałęzi, więc nie ma punktu scalenia do przeanalizowania.
                         reply.offset(data_offset as i64);
-                        found = true;
-                        break;
+                        return;
                     }
                 }
-                if !found {
-                    // Brak danych od tego offsetu — ENXIO zgodnie z POSIX.
-                    reply.error(ENXIO);
-                }
+                // Brak danych od tego offsetu — ENXIO zgodnie z POSIX.
+                reply.error(ENXIO);
             }
 
             SEEK_HOLE => {
                 // Znajdź następny hole od `offset`.
                 let start_block = (offset as u64 / FS_BLOCK_SIZE as u64) as usize;
                 let max_block   = ((file_size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64) as usize;
-                let mut found   = false;
                 for bi in start_block..max_block {
                     let bkey = format!("data:{}:{}", ino, bi);
                     if self.db.get(bkey.as_bytes()).unwrap_or(None).is_none() {
                         let hole_offset = (bi as u64 * FS_BLOCK_SIZE as u64).max(offset as u64);
                         reply.offset(hole_offset as i64);
-                        found = true;
-                        break;
+                        return;
                     }
                 }
-                if !found {
-                    // Cały plik jest danymi — hole jest na końcu pliku (POSIX).
-                    reply.offset(file_size as i64);
-                }
+                // Cały plik jest danymi — hole jest na końcu pliku (POSIX).
+                reply.offset(file_size as i64);
             }
 
             _ => { reply.error(libc::EINVAL); }
