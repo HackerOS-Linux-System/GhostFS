@@ -1,12 +1,17 @@
 name: build
 
-# Builds GhostFS (normal + cybersec binaries) and packages them into a
-# single .deb — "ghostfs" — which:
+# Builds GhostFS (normal and/or cybersec binaries — see the `variant` input
+# below) and packages them into a single .deb — "ghostfs" — which:
 #   1. installs the ghostfs / ghostfs-cybersec binaries + admin tooling +
 #      initramfs early-boot hooks, and
 #   2. assumes Calamares is ALREADY installed on the target system, and
 #      patches its configuration so the graphical installer offers ONLY
 #      GhostFS as a root filesystem (no ext4/btrfs/xfs choice).
+#
+# Manual runs (Actions tab -> Run workflow) let you pick which variant to
+# build via a dropdown: 'both' (default, matches push/PR/tag behaviour),
+# 'normal' only, or 'cybersec' only. Useful for a quick build of just the
+# variant you're testing, or to halve CI time when you don't need both.
 #
 # This workflow does NOT install anything on the runner beyond build
 # dependencies — it produces a .deb artifact for you to install elsewhere
@@ -27,7 +32,17 @@ on:
       - 'v*'
   pull_request:
     branches: [ main ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Which binary/binaries to build and package'
+        required: true
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - normal
+          - cybersec
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,9 +51,26 @@ env:
 jobs:
   build-deb:
     runs-on: ubuntu-latest
+    outputs:
+      variant: ${{ steps.variant.outputs.variant }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Determine build variant
+        id: variant
+        run: |
+          # workflow_dispatch lets you pick 'normal' / 'cybersec' / 'both'
+          # from the Actions UI (Run workflow -> Variant dropdown). Push/PR/
+          # tag triggers have no inputs at all, so default to 'both' — the
+          # previous, always-build-everything behaviour.
+          VARIANT="${{ github.event.inputs.variant || 'both' }}"
+          case "$VARIANT" in
+            both|normal|cybersec) : ;;
+            *) echo "::error::Unknown variant '$VARIANT' — must be both/normal/cybersec"; exit 1 ;;
+          esac
+          echo "variant=$VARIANT" >> "$GITHUB_OUTPUT"
+          echo "Building variant: $VARIANT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,41 +107,61 @@ jobs:
       # Two separate binaries, per Makefile / build.hl convention:
       #   normal   — encryption optional (--encryption flag at mkfs time)
       #   cybersec — encryption always on, MAC/IDS/forensics/canary active
+      # Which one(s) get built is controlled by the `variant` workflow_dispatch
+      # input (see "Determine build variant" step above) — both by default
+      # (push/PR/tag triggers, which have no input to choose from).
       - name: cargo build (normal)
-        working-directory: .
+        if: steps.variant.outputs.variant == 'normal' || steps.variant.outputs.variant == 'both'
         run: |
           cargo build --release --no-default-features \
             --features normal,zstd,lz4
 
       - name: Stash normal binary
+        if: steps.variant.outputs.variant == 'normal' || steps.variant.outputs.variant == 'both'
         run: |
           mkdir -p dist
           cp target/release/ghostfs dist/ghostfs-normal
 
       - name: cargo build (cybersec)
+        if: steps.variant.outputs.variant == 'cybersec' || steps.variant.outputs.variant == 'both'
         run: |
           cargo build --release --no-default-features \
             --features cybersec,zstd,lz4
 
       - name: Stash cybersec binary
+        if: steps.variant.outputs.variant == 'cybersec' || steps.variant.outputs.variant == 'both'
         run: |
+          mkdir -p dist
           cp target/release/ghostfs dist/ghostfs-cybersec
 
       - name: cargo test (best-effort — repo currently has no test suite)
-        run: cargo test --release --no-default-features --features cybersec,zstd,lz4 || \
-          echo "::warning::No tests ran (or tests failed) — see README 'testowanie' section. Not blocking the build."
+        # Test whichever variant was actually built; prefer cybersec features
+        # when both are available (exercises the larger feature surface).
+        run: |
+          if [ "${{ steps.variant.outputs.variant }}" = "normal" ]; then
+            FEATURES="normal,zstd,lz4"
+          else
+            FEATURES="cybersec,zstd,lz4"
+          fi
+          cargo test --release --no-default-features --features "$FEATURES" || \
+            echo "::warning::No tests ran (or tests failed) — see README 'testowanie' section. Not blocking the build."
 
       # ── Assemble the .deb payload tree ───────────────────────────────────────
       - name: Assemble packaging tree
         run: |
           set -eux
+          VARIANT="${{ steps.variant.outputs.variant }}"
           PKGROOT="$(mktemp -d)/ghostfs"
           mkdir -p "$PKGROOT"
           cp -r packaging/deb/. "$PKGROOT/"
 
-          # Binaries
-          install -Dm755 dist/ghostfs-normal   "$PKGROOT/usr/local/bin/ghostfs"
-          install -Dm755 dist/ghostfs-cybersec "$PKGROOT/usr/local/bin/ghostfs-cybersec"
+          # Binaries — only the one(s) actually built for this variant.
+          if [ "$VARIANT" = "normal" ] || [ "$VARIANT" = "both" ]; then
+            install -Dm755 dist/ghostfs-normal "$PKGROOT/usr/local/bin/ghostfs"
+          fi
+          if [ "$VARIANT" = "cybersec" ] || [ "$VARIANT" = "both" ]; then
+            install -Dm755 dist/ghostfs-cybersec "$PKGROOT/usr/local/bin/ghostfs-cybersec"
+          fi
 
           # Admin / mount helper scripts
           install -Dm755 scripts/ghostfs-admin.sh "$PKGROOT/usr/local/bin/ghostfs-admin.sh"
@@ -126,11 +178,22 @@ jobs:
           cp -r calamares/modules/ghostfs-umount "$PKGROOT/usr/lib/calamares/modules/"
           chmod 755 "$PKGROOT"/usr/lib/calamares/modules/*/*.py
 
-          # Calamares config: static ghostfs-mkfs.conf installed directly;
-          # settings.conf + partition.conf patch shipped as docs and applied
-          # by postinst via calamares-patch.py (so we can revert on removal).
+          # Calamares mkfs config: points at whichever binary the installer
+          # should actually use for the format step. The static file checked
+          # into the repo (calamares/config/ghostfs-mkfs.conf) defaults to
+          # cybersec — correct for 'both' and 'cybersec'. For 'normal'-only
+          # builds it would reference a binary that doesn't exist in this
+          # .deb at all, so we patch those two lines with `sed` instead of
+          # maintaining a second copy of the whole file (single source of
+          # truth — avoids the two configs silently drifting apart).
           install -Dm644 calamares/config/ghostfs-mkfs.conf \
             "$PKGROOT/etc/calamares/modules/ghostfs-mkfs.conf"
+          if [ "$VARIANT" = "normal" ]; then
+            sed -i \
+              -e 's#^ghostfsBin:.*#ghostfsBin:   "/usr/local/bin/ghostfs"#' \
+              -e 's#^cybersecMode:.*#cybersecMode: false#' \
+              "$PKGROOT/etc/calamares/modules/ghostfs-mkfs.conf"
+          fi
           install -Dm644 calamares/config/settings.conf.ghostfs \
             "$PKGROOT/usr/share/doc/ghostfs/settings.conf.ghostfs"
           install -Dm644 calamares/config/partition.conf.ghostfs-patch.yaml \
@@ -139,6 +202,11 @@ jobs:
           # Docs
           install -Dm644 README.md "$PKGROOT/usr/share/doc/ghostfs/README.md"
           install -Dm644 LICENSE   "$PKGROOT/usr/share/doc/ghostfs/copyright"
+
+          # Note which variant this package was built with — visible via
+          # `dpkg -s ghostfs` / `apt show ghostfs` for anyone debugging
+          # "why is ghostfs-cybersec missing" later.
+          sed -i "/^Description:/a Built-Variant: ${VARIANT}" "$PKGROOT/DEBIAN/control"
 
           # Fill in Installed-Size (KB) — dpkg-deb doesn't require it but
           # apt/dpkg -l output is nicer with it present.
@@ -158,6 +226,7 @@ jobs:
         # build HERE if any are missing.
         run: |
           set -eu
+          VARIANT="${{ steps.variant.outputs.variant }}"
           MISSING=0
           check() {
             if [ ! -e "$PKGROOT/$1" ]; then
@@ -166,8 +235,12 @@ jobs:
             fi
           }
           check "usr/lib/ghostfs/calamares-patch.py"
-          check "usr/local/bin/ghostfs"
-          check "usr/local/bin/ghostfs-cybersec"
+          if [ "$VARIANT" = "normal" ] || [ "$VARIANT" = "both" ]; then
+            check "usr/local/bin/ghostfs"
+          fi
+          if [ "$VARIANT" = "cybersec" ] || [ "$VARIANT" = "both" ]; then
+            check "usr/local/bin/ghostfs-cybersec"
+          fi
           check "usr/local/bin/ghostfs-admin.sh"
           check "sbin/mount.ghostfs"
           check "etc/initramfs-tools/hooks/ghostfs"
@@ -181,11 +254,10 @@ jobs:
           check "DEBIAN/postinst"
           check "DEBIAN/postrm"
           if [ "$MISSING" = "1" ]; then
-            echo "::error::Packaging tree is incomplete — see missing files above. \
-Refusing to build a .deb that would silently fail its own postinst at install time."
+            echo "::error::Packaging tree is incomplete — see missing files above. Refusing to build a .deb that would silently fail its own postinst at install time."
             exit 1
           fi
-          echo "✓ packaging tree complete"
+          echo "✓ packaging tree complete for variant=$VARIANT"
 
       - name: Verify initramfs script is POSIX sh (dash) compatible
         # update-initramfs runs local-top scripts via /bin/sh (dash on
@@ -233,7 +305,7 @@ Refusing to build a .deb that would silently fail its own postinst at install ti
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ghostfs-deb-${{ env.DEB_VERSION }}
+          name: ghostfs-deb-${{ env.DEB_VERSION }}-${{ steps.variant.outputs.variant }}
           path: out/*.deb
           if-no-files-found: error
 
@@ -251,6 +323,8 @@ Refusing to build a .deb that would silently fail its own postinst at install ti
     # package (real Calamares is heavy/GUI-oriented and not worth pulling
     # into CI just to check our postinst/postrm patch logic runs and
     # reverts without crashing).
+    env:
+      VARIANT: ${{ needs.build-deb.outputs.variant }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -314,9 +388,15 @@ Refusing to build a .deb that would silently fail its own postinst at install ti
       - name: Verify mount.ghostfs and binaries were installed
         run: |
           test -x /sbin/mount.ghostfs
-          test -x /usr/local/bin/ghostfs
-          test -x /usr/local/bin/ghostfs-cybersec
-          /usr/local/bin/ghostfs --help
+          if [ "$VARIANT" = "normal" ] || [ "$VARIANT" = "both" ]; then
+            test -x /usr/local/bin/ghostfs
+            /usr/local/bin/ghostfs --help
+          fi
+          if [ "$VARIANT" = "cybersec" ] || [ "$VARIANT" = "both" ]; then
+            test -x /usr/local/bin/ghostfs-cybersec
+            /usr/local/bin/ghostfs-cybersec --help
+          fi
+          echo "OK: variant=$VARIANT binaries present as expected"
 
       - name: Remove ghostfs and verify Calamares config was restored
         run: |
