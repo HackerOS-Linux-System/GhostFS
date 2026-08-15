@@ -39,7 +39,19 @@ impl Repair {
             Some(d) => d,
             None    => return Ok(false),
         };
-        let inode: crate::serialization::Inode = bincode::deserialize(&inode_data)?;
+        // Metadane inode są szyfrowane od v0.9 (patrz Crypto::derive_inode_enc_key)
+        // — gdy wolumin ma klucz (`self.crypto` = Some, czyli cybersec/encrypted
+        // mode), trzeba je odszyfrować zanim odczytamy `attr.size`. Gdy wolumin
+        // jest bez szyfrowania (`self.crypto` = None), dane leżą jako zwykły
+        // bincode, tak jak zawsze.
+        let inode: crate::serialization::Inode = match &self.crypto {
+            Some(crypto) => {
+                let key = crypto.derive_inode_enc_key();
+                let plain = crypto.decrypt_with_key(&key, &inode_data)?;
+                bincode::deserialize(&plain)?
+            }
+            None => bincode::deserialize(&inode_data)?,
+        };
         let block_count = (inode.attr.size + FS_BLOCK_SIZE as u64 - 1) / FS_BLOCK_SIZE as u64;
 
         let mut corrupted = false;
