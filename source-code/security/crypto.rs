@@ -17,6 +17,9 @@ const REKEK_CTX:    &[u8] = b"ghostfs-rekey-wrapping-v1";
 const DIRENC_CTX:   &[u8] = b"ghostfs-dirname-encryption-v1";
 const DIRNAME_BLIND_CTX: &[u8] = b"ghostfs-dirname-blindindex-v1";
 const SIGNING_KEY_CTX: &[u8] = b"ghostfs-forensics-signing-key-v1";
+const INODE_ENC_CTX: &[u8] = b"ghostfs-inode-metadata-encryption-v1";
+const XATTR_ENC_CTX: &[u8] = b"ghostfs-xattr-encryption-v1";
+const XATTR_BLIND_CTX: &[u8] = b"ghostfs-xattr-blindindex-v1";
 
 /// AAD = "GFS" || ino (8B LE) || block_idx (8B LE) || volume_uuid (16B)
 /// Wiąże szyfrogram z konkretnym blokiem konkretnego pliku konkretnego wolumenu.
@@ -133,6 +136,56 @@ impl Crypto {
         let mut h = Hasher::new_keyed(&self.master_key);
         h.update(SIGNING_KEY_CTX);
         h.update(&self.volume_uuid);
+        *h.finalize().as_bytes()
+    }
+
+    /// Klucz szyfrujący METADANE inode (rozmiar, uprawnienia, czasy,
+    /// uid/gid) — wcześniej `fuser::FileAttr` leżał jako jawny `bincode`
+    /// wprost w wartości klucza sled `inode:{ino}`, mimo że dane bloków
+    /// (`data:*`) i nazwy plików (`didx:*`, patrz dirindex.rs) były już
+    /// szyfrowane. Ktoś z dostępem tylko do plików bazy sled (skopiowany
+    /// obraz dysku, backup bez klucza) mógł odczytać rozmiar, właściciela,
+    /// uprawnienia i znaczniki czasu KAŻDEGO pliku bez znajomości master
+    /// key — dla systemu plików reklamującego się jako "cybersecurity"
+    /// to była realna luka poufności metadanych, nie tylko teoretyczna.
+    ///
+    /// Jeden klucz dla całego wolumenu (nie per-inode jak FEK) — metadane
+    /// nie mają tej samej potrzeby izolacji co dane plików, a unikalność
+    /// nonce jest i tak gwarantowana przez schemat sesyjny w `next_nonce()`.
+    pub fn derive_inode_enc_key(&self) -> Key {
+        let mut h = Hasher::new_keyed(&self.master_key);
+        h.update(INODE_ENC_CTX);
+        h.update(&self.volume_uuid);
+        *h.finalize().as_bytes()
+    }
+
+    /// Klucz szyfrujący WARTOŚĆ rozszerzonego atrybutu (xattr) danego
+    /// inode — patrz `fs/xattr.rs`. Wcześniej zarówno NAZWA (wprost w
+    /// kluczu sled) jak i WARTOŚĆ xattr leżały jawnym tekstem — a xattr
+    /// bywają wrażliwe (etykiety SELinux/ACL, tokeny, metadane aplikacji
+    /// typu "pobrano z <url>"), więc to była realna, nie tylko teoretyczna
+    /// luka poufności, tej samej klasy co nazwy plików i metadane inode.
+    pub fn derive_xattr_enc_key(&self, ino: u64) -> Key {
+        let mut h = Hasher::new_keyed(&self.master_key);
+        h.update(XATTR_ENC_CTX);
+        h.update(&ino.to_le_bytes());
+        h.update(&self.volume_uuid);
+        *h.finalize().as_bytes()
+    }
+
+    /// Blind index dla NAZWY xattr — ten sam wzorzec co
+    /// `dirname_blind_index`: deterministyczny, kluczowany master_key,
+    /// pozwala na lookup/set/remove O(1) bez odszyfrowywania, ale odporny
+    /// na atak słownikowy na typowe nazwy xattr ("security.selinux",
+    /// "user.comment", ...) bez znajomości klucza.
+    pub fn xattr_blind_index(&self, ino: u64, name: &[u8]) -> [u8; 32] {
+        let mut ctx_hasher = Hasher::new_keyed(&self.master_key);
+        ctx_hasher.update(XATTR_BLIND_CTX);
+        ctx_hasher.update(&ino.to_le_bytes());
+        ctx_hasher.update(&self.volume_uuid);
+        let subkey = *ctx_hasher.finalize().as_bytes();
+        let mut h = Hasher::new_keyed(&subkey);
+        h.update(name);
         *h.finalize().as_bytes()
     }
 
