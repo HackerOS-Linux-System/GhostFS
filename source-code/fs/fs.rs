@@ -96,13 +96,12 @@ impl Filesystem for GhostFS {
         let pi    = self.get_inode(parent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
             b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.insert(parent, name, ino).ok();
+        if let Err(e) = self.dirindex.insert(parent, name, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "mknod", ino, Some(name)).ok();
         reply.entry(&TTL, &attr, 0);
     }
@@ -120,13 +119,12 @@ impl Filesystem for GhostFS {
         let pi = self.get_inode(parent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
             b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now; pa.nlink += 1;
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.insert(parent, name, ino).ok();
+        if let Err(e) = self.dirindex.insert(parent, name, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "mkdir", ino, Some(name)).ok();
         reply.entry(&TTL, &attr, 0);
     }
@@ -158,14 +156,13 @@ impl Filesystem for GhostFS {
             let rp = format!("ref:{}:",  ino);
             let xp = format!("xattr:{}:", ino);
             if let Err(e) = self.with_batch(|b| {
-                b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
                 b.remove(format!("inode:{}", ino).as_bytes());
                 for item in self.db.scan_prefix(dp.as_bytes()) { let (k,_) = item?; b.remove(k); }
                 for item in self.db.scan_prefix(hp.as_bytes()) { let (k,_) = item?; b.remove(k); }
                 for item in self.db.scan_prefix(rp.as_bytes()) { let (k,_) = item?; b.remove(k); }
                 for item in self.db.scan_prefix(xp.as_bytes()) { let (k,_) = item?; b.remove(k); }
                 if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
-                    b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                    b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
                 Ok(())
             }) { reply.error(e.into()); return; }
             self.extents.remove_all(ino).ok();
@@ -180,14 +177,13 @@ impl Filesystem for GhostFS {
             self.quota.release_usage(file_uid, file_size).ok();
         } else {
             if let Err(e) = self.with_batch(|b| {
-                b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-                b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+                b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
                 if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
-                    b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                    b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
                 Ok(())
             }) { reply.error(e.into()); return; }
         }
-        self.dirindex.remove(parent, name).ok();
+        if let Err(e) = self.dirindex.remove(parent, name) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "unlink", ino, Some(name)).ok();
         reply.ok();
     }
@@ -200,13 +196,16 @@ impl Filesystem for GhostFS {
         if !self.is_dir_empty(ino).unwrap_or(false) { reply.error(ENOTEMPTY); return; }
         let pi = self.get_inode(parent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
-            b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
             b.remove(format!("inode:{}", ino).as_bytes());
             if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now(); pa.nlink -= 1;
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.remove(parent, name).ok();
+        if let Err(e) = self.dirindex.remove(parent, name) { reply.error(e.into()); return; }
+        // Poprawka: rmdir (w przeciwieństwie do unlink) NIGDY nie czyściło
+        // xattr katalogu — osierocone wpisy (np. etykieta SELinux, ACL)
+        // zostawały w bazie na zawsze po skasowaniu katalogu.
+        self.xattr.remove_all(ino).ok();
         // Zwolnij kwotę dla katalogu (metadane, zwykle rozmiar 0 ale rozliczany).
         self.quota.release_usage(inode.attr.uid, inode.attr.size).ok();
         self.log_audit(req.uid(), "rmdir", ino, Some(name)).ok();
@@ -227,14 +226,13 @@ impl Filesystem for GhostFS {
         let pi    = self.get_inode(parent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
             b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             b.insert(format!("data:{}:0", ino).as_bytes(), target);
             if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.insert(parent, name, ino).ok();
+        if let Err(e) = self.dirindex.insert(parent, name, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "symlink", ino, Some(name)).ok();
         reply.entry(&TTL, &attr, 0);
     }
@@ -259,13 +257,12 @@ impl Filesystem for GhostFS {
         inode.attr.nlink += 1;
         let npi = self.get_inode(newparent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
-            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            b.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             if let Some(p) = npi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = SystemTime::now();
-                b.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", newparent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.insert(newparent, newname, ino).ok();
+        if let Err(e) = self.dirindex.insert(newparent, newname, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "link", ino, Some(newname)).ok();
         reply.entry(&TTL, &inode.attr.into(), 0);
     }
@@ -290,24 +287,22 @@ impl Filesystem for GhostFS {
         let op   = self.get_inode(parent).ok().flatten();
         let np   = self.get_inode(newparent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
-            b.remove(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes());
-            b.insert(format!("dir:{}:{}", newparent, String::from_utf8_lossy(newname.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
             if parent != newparent && kind == fuser::FileType::Directory {
                 inode.parent = newparent;
-                b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
+                b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             }
             if let Some(p) = op { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
                 if kind == fuser::FileType::Directory { pa.nlink -= 1; }
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             if parent != newparent {
                 if let Some(p) = np { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
                     if kind == fuser::FileType::Directory { pa.nlink += 1; }
-                    b.insert(format!("inode:{}", newparent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                    b.insert(format!("inode:{}", newparent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.remove(parent, name).ok();
-        self.dirindex.insert(newparent, newname, ino).ok();
+        if let Err(e) = self.dirindex.remove(parent, name) { reply.error(e.into()); return; }
+        if let Err(e) = self.dirindex.insert(newparent, newname, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "rename", ino, Some(newname)).ok();
         reply.ok();
     }
@@ -394,13 +389,12 @@ impl Filesystem for GhostFS {
         let pi    = self.get_inode(parent).ok().flatten();
         if let Err(e) = self.with_batch(|b| {
             b.insert(b"next_ino", bincode::serialize(&self.next_ino.load(Ordering::SeqCst))?);
-            b.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(&inode)?);
-            b.insert(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes(), bincode::serialize(&ino)?);
+            b.insert(format!("inode:{}", ino).as_bytes(), self.encrypt_inode(&inode)?);
             if let Some(p) = pi { let mut pa: fuser::FileAttr = p.attr.into(); pa.mtime = now;
-                b.insert(format!("inode:{}", parent).as_bytes(), bincode::serialize(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
+                b.insert(format!("inode:{}", parent).as_bytes(), self.encrypt_inode(&serialization::Inode { attr: pa.into(), parent: p.parent })?); }
             Ok(())
         }) { reply.error(e.into()); return; }
-        self.dirindex.insert(parent, name, ino).ok();
+        if let Err(e) = self.dirindex.insert(parent, name, ino) { reply.error(e.into()); return; }
         self.log_audit(req.uid(), "create", ino, Some(name)).ok();
         reply.created(&TTL, &attr, 0, 0, flags as u32);
     }
