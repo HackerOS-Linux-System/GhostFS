@@ -213,7 +213,7 @@ jobs:
           SIZE_KB=$(du -sk "$PKGROOT" | cut -f1)
           sed -i "/^Description:/i Installed-Size: ${SIZE_KB}" "$PKGROOT/DEBIAN/control"
 
-          chmod 755 "$PKGROOT/DEBIAN/postinst" "$PKGROOT/DEBIAN/postrm"
+          chmod 755 "$PKGROOT/DEBIAN/postinst" "$PKGROOT/DEBIAN/postrm" "$PKGROOT/DEBIAN/prerm"
           echo "PKGROOT=$PKGROOT" >> "$GITHUB_ENV"
 
       - name: Verify packaging tree completeness (fail loudly, not silently)
@@ -253,6 +253,7 @@ jobs:
           check "usr/share/doc/ghostfs/partition.conf.ghostfs-patch.yaml"
           check "DEBIAN/postinst"
           check "DEBIAN/postrm"
+          check "DEBIAN/prerm"
           if [ "$MISSING" = "1" ]; then
             echo "::error::Packaging tree is incomplete — see missing files above. Refusing to build a .deb that would silently fail its own postinst at install time."
             exit 1
@@ -266,9 +267,14 @@ jobs:
         # syntax (arrays, [[ ]], read -s) causes a hard failure INSIDE the
         # initramfs at boot — the worst possible place to discover it. Catch
         # it here instead, with the exact interpreter that will actually run it.
+        # dpkg's own maintainer scripts (preinst/postinst/prerm/postrm) are
+        # ALSO invoked via /bin/sh regardless of shebang, so check those too.
         run: |
           sudo apt-get install -y --no-install-recommends dash
           dash -n scripts/ghostfs-mount-initramfs
+          dash -n packaging/deb/DEBIAN/postinst
+          dash -n packaging/deb/DEBIAN/prerm
+          dash -n packaging/deb/DEBIAN/postrm
 
       - name: Determine package version
         run: |
@@ -321,8 +327,8 @@ jobs:
     runs-on: ubuntu-latest
     # Sanity-checks that the .deb installs cleanly against a stub Calamares
     # package (real Calamares is heavy/GUI-oriented and not worth pulling
-    # into CI just to check our postinst/postrm patch logic runs and
-    # reverts without crashing).
+    # into CI just to check our prerm/postinst patch-apply/revert logic runs
+    # correctly).
     env:
       VARIANT: ${{ needs.build-deb.outputs.variant }}
     steps:
