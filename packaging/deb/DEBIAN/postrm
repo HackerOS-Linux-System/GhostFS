@@ -1,13 +1,24 @@
 #!/bin/sh
 # postrm for ghostfs
+#
+# NOTE: the Calamares config revert used to live here, but that's wrong —
+# see DEBIAN/prerm for why (dpkg has already deleted this package's own
+# files, including calamares-patch.py, by the time `postrm remove` runs).
+# This script now only handles cleanup that genuinely belongs post-removal:
+# refreshing the initramfs (a SYSTEM tool, not one of our own files, so
+# it's fine to still be available here) and, on a full purge, clearing our
+# non-conffile state directory.
 set -e
 
 case "$1" in
-  purge|remove)
-    if [ -f /usr/lib/ghostfs/calamares-patch.py ]; then
-        python3 /usr/lib/ghostfs/calamares-patch.py revert || \
-            echo "ghostfs: WARNING failed to revert calamares config patch — check /etc/calamares/*.ghostfs-orig manually" >&2
+  purge)
+    rm -rf /etc/ghostfs 2>/dev/null || true
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u || true
     fi
+    ;;
+
+  remove)
     if command -v update-initramfs >/dev/null 2>&1; then
         update-initramfs -u || true
     fi
