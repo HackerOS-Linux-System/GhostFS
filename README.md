@@ -185,3 +185,160 @@ designed to work alongside them, not replace them.
   `/proc/swaps` and warns (once, at mount/keygen time) if active swap
   doesn't look encrypted, since `mlockall()` only protects this process's
   own memory, not swap-based leakage in general.
+
+## Fixes from real CI logs (v0.9)
+
+Two real bugs found via an actual failed GitHub Actions run (not just static
+review):
+
+- **`ghostfs-mount-initramfs` used bash syntax (`[[ ]]`, arrays, `read -s`)
+  but `update-initramfs` runs `local-top` scripts via `/bin/sh` (dash on
+  Debian/Ubuntu) regardless of the `#!/usr/bin/env bash` shebang** — this
+  produced a hard `Syntax error: "(" unexpected` at `update-initramfs -u`
+  time. Rewritten in strict POSIX sh (verified with `dash -n`, which is now
+  also a CI step in `build.yml` so this class of bug can't reoccur silently).
+- **The Calamares config patch never actually applied** in the smoke-test
+  run (`partition.conf` still showed the original ext4/btrfs/xfs list after
+  install) — root cause looks like a stale/incomplete checkout rather than a
+  logic bug, but `build.yml` previously had no way to *notice* a missing
+  packaging file before shipping a `.deb` whose `postinst` would then fail
+  at install time on someone's real machine. Added an explicit "packaging
+  tree completeness" verification step that fails the build loudly instead.
+
+## Known gap: inode metadata is still stored unencrypted (scoped, not yet fixed)
+
+While chasing down an unrelated issue, found that **directory entries were
+still being written in plaintext to a legacy `dir:{parent}:{name}` sled key
+in parallel with the encrypted `dirindex` from v0.4** — every mutating
+handler (`mkdir`, `create`, `unlink`, `rename`, ...) wrote both. The
+encrypted index existed, but a plaintext shadow copy of every filename
+defeated its entire purpose. **Fixed**: removed all active writes to the
+legacy key; `dirindex` is now the sole write path. The legacy key is only
+ever *read* now, as a migration fallback for entries written by pre-v0.4
+GhostFS. `is_dir_empty()` was also silently relying solely on that legacy
+prefix — after removing the plaintext writes this would have made every
+directory appear empty to `rmdir`, a real corruption bug; fixed to check
+`dirindex` first.
+
+**Still open**: `fuser::FileAttr` (size, permissions, timestamps, uid/gid)
+is stored as plain `bincode` in the `inode:{ino}` sled value — confirmed via
+`grep -rln 'format!("inode:{}"'`, the scope is exactly 3 files:
+  - `fs/lib.rs` (`get_inode`/`put_inode`, the canonical accessors)
+  - `fs/fs.rs` (several handlers write `inode:{ino}` directly inside atomic
+    `with_batch` closures for transactional consistency with directory
+    updates — these bypass `put_inode` and would each need the same
+    encrypt/decrypt applied)
+  - `data/repair.rs::verify_and_repair` (already holds `Option<Crypto>`,
+    deserializes the `Inode` struct directly for size/corruption checks)
+
+  `data/versioning.rs` needs **no changes** — it round-trips inode bytes as
+  an opaque blob, so it works transparently whether or not they're
+  encrypted.
+
+Deliberately not implemented this round: this touches ~8-10 call sites
+across 3 files with runtime (not compile-time) failure modes if done
+incorrectly — the kind of mistake that's expensive to discover without a
+real `cargo build` + functional test in hand. Next priority.
+
+## Inode metadata encryption (v1.0)
+
+Closed the gap documented in the v0.9 notes above: `fuser::FileAttr` (file
+size, permissions, timestamps, uid/gid) is now encrypted (AES-256-GCM,
+volume-wide key derived via `Crypto::derive_inode_enc_key`) before being
+stored as the `inode:{ino}` sled value. Previously this was plain
+`bincode` — someone with raw access to the sled database files (a stolen
+disk image, a backup without the key) could read every file's size,
+owner, permissions, and timestamps without the master key, even though
+file *contents* and *names* were already fully encrypted.
+
+Scope of the fix (verified by grepping every `format!("inode:{}"` call
+site in the project, not guessed):
+  - `fs/lib.rs`: `get_inode`/`put_inode` (canonical accessors) plus the
+    standalone `format()` (mkfs) function's root-inode write, which needed
+    its own temporary `Crypto` instance since `GhostFS` doesn't exist yet
+    at that point.
+  - `fs/fs.rs`: 17 raw `b.insert(format!("inode:{}", ...), bincode::serialize(...))`
+    calls inside atomic `with_batch` closures (for transactional
+    consistency with directory updates) — all converted to
+    `self.encrypt_inode(...)`.
+  - `data/repair.rs::verify_and_repair`: decrypts via its existing
+    `Option<Crypto>` field (falls back to plain bincode if the volume has
+    no encryption key at all, i.e. non-cybersec unencrypted mode).
+  - `data/versioning.rs` and `data/backup.rs` needed **no changes** — both
+    treat inode bytes as an opaque blob (round-tripped or filtered by key
+    string only), so they work transparently whether or not the value is
+    encrypted underneath.
+
+## Choosing a build variant in CI
+
+`.github/workflows/build.yml` can be run manually from the Actions tab
+("Run workflow") with a **Variant** dropdown: `both` (default, matches
+push/PR/tag behaviour), `normal`, or `cybersec`. Choosing `normal` or
+`cybersec` skips building/packaging the other binary entirely and
+regenerates `ghostfs-mkfs.conf` accordingly (so Calamares never points at
+a binary that isn't actually in the `.deb`). The artifact name and the
+package's `Built-Variant` control field both reflect the choice.
+
+## Extended attribute encryption + rmdir xattr cleanup (v1.1)
+
+Same class of gap as the file-name and inode-metadata fixes above, found
+by applying the same scrutiny to `fs/xattr.rs`: xattr **names** were
+embedded in plaintext directly in the sled key, and **values** were
+stored completely unencrypted. xattrs routinely hold sensitive data
+(SELinux/AppArmor labels, ACL-like data, app-set tokens, "downloaded
+from `<url>`" provenance metadata) — this was a real, active
+confidentiality gap, not theoretical.
+
+Fixed with the same architecture already proven for `dirindex.rs`: a
+keyed blind index (`Crypto::xattr_blind_index`) for O(1) lookup without
+decryption, plus AES-256-GCM for both the recoverable name and value
+(`Crypto::derive_xattr_enc_key`, per-inode).
+
+Also found and fixed, while auditing cleanup paths: **`rmdir` never
+cleaned up a directory's xattrs** — `unlink` already did this correctly
+(via a raw `db.scan_prefix("xattr:{ino}:")` cleanup that, conveniently,
+still works unchanged under the new encrypted key scheme since the key
+*prefix* convention was preserved), but `rmdir` had no equivalent,
+leaving orphaned xattr entries in the database forever after a directory
+was deleted. Fixed via the new `XAttr::remove_all`.
+
+Verified inode numbers are never reused (monotonic `AtomicU64::fetch_add`,
+no freelist) — so there's no risk of a newly created file inheriting a
+stale WORM lock or canary marker left behind by a deleted file at the
+same inode number.
+
+## Real CI confirmation + prerm/postrm ordering bug (v1.2)
+
+The full pipeline ran green end-to-end for the first time (build, cargo
+test, packaging, lintian, install) — including a genuine confirmation that
+the from-scratch GF(256) Shamir's Secret Sharing implementation
+(`security/shamir.rs`) is correct: `cargo test` actually executed
+`shamir::tests::split_combine_roundtrip` and `below_threshold_fails`, both
+`ok`.
+
+One real bug remained, caught by the `install-smoke-test` job's final
+step: **removing the package never actually restored the original
+Calamares config.** Root cause: the revert logic lived in `postrm`, but
+per Debian Policy's maintainer-script ordering, `postrm remove` runs
+*after* dpkg has already deleted the package's own files — including
+`/usr/lib/ghostfs/calamares-patch.py` itself, the very script `postrm`
+was trying to invoke. It was silently doing nothing every time. Fixed by
+adding a `prerm` (which runs *before* files are removed) that does the
+actual revert; `postrm` now only handles genuinely post-removal cleanup
+(initramfs refresh, purge-time state directory removal).
+
+Also cleaned up all 7 compiler warnings visible in the now-successful
+build log: an unused import left over from the dirname-encryption
+refactor, a legitimately-unused-for-now `remove_block` helper (kept,
+`#[allow(dead_code)]`, as a documented building block for future
+truncate-shrink support), a pre-existing unimplemented
+`INCREMENTAL_THRESHOLD` design intent in `integrity.rs`, four
+`canary-https`-feature-gated items in `canary.rs` that are legitimately
+unused in the default (non-`canary-https`) build, and a
+`drop(&mut reference)` no-op in `rate_limit.rs` replaced with the
+compiler-suggested `let _ = ...`.
+
+`build.yml`'s dash/POSIX-sh verification step now also checks
+`postinst`/`prerm`/`postrm` (previously only checked the initramfs
+script), and the packaging-completeness check now requires `DEBIAN/prerm`
+to exist.
