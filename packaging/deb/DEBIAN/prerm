@@ -1,0 +1,37 @@
+#!/bin/sh
+# prerm for ghostfs
+#
+# IMPORTANT: reverting the Calamares config patch happens HERE, not in
+# postrm. Real bug found via CI (install-smoke-test job): the revert call
+# was originally in postrm, but per Debian Policy's maintainer script
+# ordering, `postrm remove` runs AFTER dpkg has already deleted this
+# package's own files — including /usr/lib/ghostfs/calamares-patch.py
+# itself. So `postrm`'s attempt to run it was silently doing nothing (the
+# `[ -f ... ]` guard just skipped it every time), and the original
+# ext4/btrfs/xfs Calamares config was never actually restored on removal.
+# `prerm` runs BEFORE package files are removed, so calamares-patch.py is
+# still present here to run its own `revert` action against itself.
+set -e
+
+case "$1" in
+  remove)
+    if [ -f /usr/lib/ghostfs/calamares-patch.py ]; then
+        python3 /usr/lib/ghostfs/calamares-patch.py revert || \
+            echo "ghostfs: WARNING failed to revert calamares config patch — check /etc/calamares/*.ghostfs-orig manually" >&2
+    fi
+    ;;
+
+  upgrade|failed-upgrade|deconfigure)
+    # Package is being upgraded/reconfigured, not actually removed — leave
+    # the patch in place. The new version's postinst re-applies/verifies
+    # it, so reverting here would just be undone a moment later (and could
+    # race with anything reading partition.conf mid-upgrade).
+    ;;
+
+  *)
+    echo "prerm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
