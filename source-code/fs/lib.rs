@@ -182,7 +182,7 @@ impl GhostFS {
         let mut audit  = Audit::new(&db)?;
         audit.set_signing_key(&key);
         let quota      = Quota::new(&db)?;
-        let xattr      = XAttr::new(&db)?;
+        let xattr      = XAttr::new(&db, crypto.clone())?;
         let journal    = Journal::new(&db)?;
         let extents    = ExtentTree::new(&db)?;
         let dirindex   = DirIndex::new(&db, crypto.clone())?;
@@ -343,11 +343,30 @@ impl GhostFS {
 
     // ── Inode ops ─────────────────────────────────────────────────────────────
 
+    /// Zaszyfruj strukturę `Inode` (metadane: rozmiar, uprawnienia, czasy,
+    /// uid/gid) do postaci gotowej do zapisu jako wartość klucza sled
+    /// `inode:{ino}`. Patrz `Crypto::derive_inode_enc_key` dla uzasadnienia.
+    pub(crate) fn encrypt_inode(&self, inode: &serialization::Inode) -> Result<Vec<u8>, HfsError> {
+        let plain = bincode::serialize(inode)?;
+        let key = self.crypto.derive_inode_enc_key();
+        self.crypto.encrypt_with_key(&key, &plain)
+    }
+
+    /// Odwrotność `encrypt_inode` — wołane przez `get_inode` oraz przez
+    /// `data/repair.rs`, który (w przeciwieństwie do `data/versioning.rs`,
+    /// które kopiuje bajty inode 1:1 jako nieprzezroczysty blob i NIE
+    /// wymaga zmian) musi znać `attr.size`, więc realnie deserializuje.
+    pub(crate) fn decrypt_inode(&self, raw: &[u8]) -> Result<serialization::Inode, HfsError> {
+        let key = self.crypto.derive_inode_enc_key();
+        let plain = self.crypto.decrypt_with_key(&key, raw)?;
+        Ok(bincode::deserialize(&plain)?)
+    }
+
     pub(crate) fn get_inode(&mut self, ino: u64) -> Result<Option<serialization::Inode>, HfsError> {
         if let Some(cached) = self.cache.get_inode(ino) { return Ok(Some(cached)); }
         match self.db.get(format!("inode:{}", ino).as_bytes())? {
             Some(b) => {
-                let inode: serialization::Inode = bincode::deserialize(&b)?;
+                let inode = self.decrypt_inode(&b)?;
                 self.cache.put_inode(ino, inode.clone());
                 Ok(Some(inode))
             }
@@ -356,13 +375,19 @@ impl GhostFS {
     }
 
     pub(crate) fn put_inode(&mut self, ino: u64, inode: &serialization::Inode) -> Result<(), HfsError> {
-        self.db.insert(format!("inode:{}", ino).as_bytes(), bincode::serialize(inode)?)?;
+        let enc = self.encrypt_inode(inode)?;
+        self.db.insert(format!("inode:{}", ino).as_bytes(), enc)?;
         self.cache.put_inode(ino, inode.clone());
         Ok(())
     }
 
     pub(crate) fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<Option<u64>, HfsError> {
         if let Some(ino) = self.dirindex.lookup(parent, name)? { return Ok(Some(ino)); }
+        // Fallback WYŁĄCZNIE dla wpisów zapisanych przez wersje GhostFS
+        // sprzed szyfrowania nazw katalogów (< v0.4) — te NIGDY nie trafiły
+        // do zaszyfrowanego dirindex, tylko do tego jawnego klucza. Od v0.4
+        // żaden kod już tu NIE PISZE (patrz historia fs.rs) — to czysta
+        // ścieżka odczytu dla migracji, nie aktywny mechanizm przechowywania.
         match self.db.get(format!("dir:{}:{}", parent, String::from_utf8_lossy(name.as_bytes())).as_bytes())? {
             Some(v) => Ok(Some(bincode::deserialize(&v)?)),
             None    => Ok(None),
@@ -467,10 +492,26 @@ impl GhostFS {
     }
 
     pub(crate) fn is_dir_empty(&self, ino: u64) -> Result<bool, HfsError> {
+        // Sprawdź zaszyfrowany dirindex NAJPIERW (aktywny mechanizm od v0.4).
+        // Wcześniej ta funkcja sprawdzała WYŁĄCZNIE stary jawny prefiks
+        // "dir:{ino}:" — od kiedy nic już tam nie pisze (patrz `lookup_name`),
+        // to zawsze zwracałoby `true` (katalog "pusty"), pozwalając na
+        // `rmdir` NIEPUSTEGO katalogu — poważny bug korupcji danych, nie
+        // tylko przeoczenie. Legacy prefiks wciąż sprawdzany jako fallback
+        // dla wpisów sprzed migracji.
+        if !self.dirindex.list(ino)?.is_empty() {
+            return Ok(false);
+        }
         Ok(self.db.scan_prefix(format!("dir:{}:", ino).as_bytes()).next().is_none())
     }
 
     pub(crate) fn readdir_entries(&mut self, ino: u64) -> Result<Vec<(u64, fuser::FileType, OsString)>, HfsError> {
+        // Uwaga: jeśli katalog ma MIESZANY stan (część wpisów sprzed v0.4 w
+        // starym jawnym formacie, część nowych w dirindex — możliwe tylko
+        // jeśli entries dodawano zarówno przed jak i po aktualizacji bez
+        // pełnej migracji), zwracamy TYLKO wpisy z dirindex, ignorując stare.
+        // `is_dir_empty` powyżej sprawdza oba źródła poprawnie; to tylko
+        // listowanie zawartości ma ten wąski, rzadki przypadek brzegowy.
         if let Ok(indexed) = self.dirindex.list(ino) {
             if !indexed.is_empty() {
                 let mut out = Vec::new();
@@ -606,13 +647,19 @@ pub fn format(db_path: &Path, master_key: &Key, kdf_params: crate::kdf::KdfParam
         perm: 0o755, nlink: 2, uid: 0, gid: 0,
         rdev: 0, blksize: bs, flags: 0,
     };
-    batch.insert(
-        format!("inode:{}", ROOT_INO).as_bytes(),
-        bincode::serialize(&serialization::Inode { attr: root_attr.into(), parent: 0 })?,
-    );
-    // Superblock zawiera KDF params i volume_uuid — kluczowe dla round-trip mount.
-    // volume_uuid generowany RAZ tutaj i persystowany (patrz superblock.rs doc).
+    // volume_uuid generowany RAZ tutaj i persystowany (patrz superblock.rs
+    // doc) — MUSI powstać PRZED zaszyfrowaniem inode roota, bo klucz
+    // szyfrujący metadane inode jest z niego derywowany (patrz
+    // Crypto::derive_inode_enc_key). GhostFS (i jego pole `crypto`)
+    // jeszcze nie istnieje na tym etapie (to funkcja mkfs, nie metoda),
+    // więc budujemy tymczasową instancję `Crypto` wyłącznie do tego celu.
     let volume_uuid: [u8; 16] = rand::random();
+    let mkfs_crypto = crate::crypto::Crypto::new_with_uuid(*master_key, volume_uuid)?;
+    let root_inode = serialization::Inode { attr: root_attr.into(), parent: 0 };
+    let root_plain = bincode::serialize(&root_inode)?;
+    let root_enc = mkfs_crypto.encrypt_with_key(&mkfs_crypto.derive_inode_enc_key(), &root_plain)?;
+    batch.insert(format!("inode:{}", ROOT_INO).as_bytes(), root_enc);
+    // Superblock zawiera KDF params i volume_uuid — kluczowe dla round-trip mount.
     let sb = Superblock::new(bs, master_key, kdf_params, volume_uuid)?;
     batch.insert(b"sb:data", bincode::serialize(&sb)?);
     db.apply_batch(batch)?;
