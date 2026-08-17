@@ -1,21 +1,141 @@
-// cargo
-// rustc
+#!/usr/bin/hl
+using <gen 2>
 
-> cargo build --release --features normal
-;; lub cargo build --release --no-default-features --features normal,zstd,lz4
-;; dla cybersec:
-;; cargo build --release --features cybersec
-;; cargo build --release --no-default-features --features cybersec,zstd,lz4
+# <main/colors>
 
-;; uzywanie wersji normalnej: Tworzenie systemu plików (opcjonalne szyfrowanie)
-;; ./target/release/hfs mkfs --device /path/to/db --encryption false
-;; Montowanie (szyfrowanie opcjonalne)
-;; ./target/release/hfs mount --device /path/to/db --mountpoint /mnt/hfs --cybersecurity false
+% INSTALL_DIR: str = /usr/local/bin
+% CARGO: str = cargo
 
-;; uzywanie wersji cybersec: Tworzenie systemu plików (wymuszone szyfrowanie)
-;; ./target/release/hfs mkfs --device /path/to/db
-;; Montowanie (wymuszone szyfrowanie z kluczem)
-;; ./target/release/hfs mount --device /path/to/db --mountpoint /mnt/hfs --key-file key.txt
+;; ── Helper ────────────────────────────────────────────────
 
-;; > sudo apt install libfuse3-dev
-;; install dependeces ^^^^^
+: info def
+    ::cyan ▶ @msg
+done
+
+: ok def
+    ::green ✓ @msg
+done
+
+;; ── Targets ───────────────────────────────────────────────
+
+: normal def
+    -- info
+    \~> Building GhostFS Normal (release)...
+    > @CARGO build --release --features normal,zstd,lz4
+    -- ok
+    \~> Binary: target/release/ghostfs
+done
+
+: cybersec def
+    -- info
+    \~> Building GhostFS Cybersec (release)...
+    > @CARGO build --no-default-features --release --features cybersec,zstd,lz4
+    -- ok
+    \~> Binary: target/release/ghostfs  [CYBERSEC MODE]
+done
+
+: normal-debug def
+    > @CARGO build --features normal,zstd,lz4
+done
+
+: cybersec-debug def
+    > @CARGO build --no-default-features --features cybersec,zstd,lz4
+done
+
+: test def
+    -- info
+    \~> Testing Normal mode...
+    > @CARGO test --features normal,zstd,lz4
+
+    -- info
+    \~> Testing Cybersec mode...
+    > @CARGO test --no-default-features --features cybersec,zstd,lz4
+done
+
+: install def
+    -- normal
+    ^> install -m 755 target/release/ghostfs @INSTALL_DIR/ghostfs
+    -- ok
+    \~> Installed to @INSTALL_DIR/ghostfs
+done
+
+: install-cybersec def
+    -- cybersec
+    ^> install -m 755 target/release/ghostfs @INSTALL_DIR/ghostfs-cybersec
+    -- ok
+    \~> Installed to @INSTALL_DIR/ghostfs-cybersec
+done
+
+: fmt def
+    > @CARGO fmt --all
+done
+
+: check def
+    > @CARGO check --features normal,zstd,lz4
+    > @CARGO check --no-default-features --features cybersec,zstd,lz4
+    > @CARGO clippy --features normal,zstd,lz4 -- -D warnings
+done
+
+: clean def
+    > @CARGO clean
+done
+
+: all def
+    -- normal
+done
+
+: help def
+    \~> GhostFS Makefile (Hacker Lang)
+    \~> 
+    \~> Available targets:
+    \~>   normal           — build Normal mode (release)
+    \~>   cybersec         — build Cybersec mode (release)
+    \~>   normal-debug     — build Normal mode (debug)
+    \~>   cybersec-debug   — build Cybersec mode (debug)
+    \~>   test             — run tests for both modes
+    \~>   install          — install Normal to /usr/local/bin
+    \~>   install-cybersec — install Cybersec version
+    \~>   fmt              — cargo fmt --all
+    \~>   check            — cargo check + clippy
+    \~>   clean            — cargo clean
+    \~>   all              — same as normal
+    \~>   help             — this message
+done
+
+;; ── Dispatcher ────────────────────────────────────────────
+
+% target: str = all
+
+? @argc > 0
+    % target = @arg0
+done
+
+? switch @target
+| normal
+    -- normal
+| cybersec
+    -- cybersec
+| normal-debug
+    -- normal-debug
+| cybersec-debug
+    -- cybersec-debug
+| test
+    -- test
+| install
+    -- install
+| install-cybersec
+    -- install-cybersec
+| fmt
+    -- fmt
+| check
+    -- check
+| clean
+    -- clean
+| all
+    -- all
+| help
+    -- help
+| *
+    ::red Unknown target: @target
+    -- help
+done
