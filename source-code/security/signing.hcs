@@ -1,3 +1,13 @@
+get <crates:sled::0.34>
+get <crates:serde::1.0>
+get <crates:log::0.4>
+get <crates:blake3::1.5>
+get <crates:rand::0.8>
+get <crates:hex::0.4>
+get <crates:ed25519-dalek::2>
+
+fun hks_source_code_security_signing() [
+    native {Rust} [
 use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
 use rand::rngs::OsRng as RandOsRng;
 use sled::Db;
@@ -97,3 +107,6 @@ pub fn verify_signed_export(manifest: &SignedExportManifest, payload: &[u8]) -> 
     let signature = Signature::from_bytes(&sig_arr);
     Ok(verifying_key.verify(&manifest.payload_hash, &signature).is_ok())
 }
+
+    ]
+]
