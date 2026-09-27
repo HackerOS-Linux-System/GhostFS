@@ -1,3 +1,10 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:serde::1.0>
+get <crates:blake3::1.5>
+
+fun hks_source_code_audit_audit() [
+    native {Rust} [
 use sled::Db;
 use serde::{Serialize, Deserialize};
 use std::ffi::OsStr;
@@ -151,3 +158,6 @@ impl Audit {
         Ok(verified)
     }
 }
+
+    ]
+]
