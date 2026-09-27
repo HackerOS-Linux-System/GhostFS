@@ -1,3 +1,8 @@
+get <crates:fuser::0.15>
+get <crates:serde::1.0>
+
+fun hks_source_code_core_serialization() [
+    native {Rust} [
 use serde::{Serialize, Deserialize};
 use std::time::SystemTime;
 
@@ -64,3 +69,6 @@ pub struct Inode {
     pub attr: SerFileAttr,
     pub parent: u64,
 }
+
+    ]
+]
