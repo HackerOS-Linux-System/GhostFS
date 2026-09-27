@@ -1,3 +1,11 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:serde::1.0>
+get <crates:log::0.4>
+get <crates:libc::0.2>
+
+fun hks_source_code_security_mac() [
+    native {Rust} [
 use libc;
 use sled::Db;
 use serde::{Serialize, Deserialize};
@@ -167,3 +175,6 @@ impl MacLabels {
         self.check_ct(ino, uid, gid, mask)
     }
 }
+
+    ]
+]
