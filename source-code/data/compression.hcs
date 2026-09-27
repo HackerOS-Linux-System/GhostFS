@@ -1,3 +1,10 @@
+get <crates:log::0.4>
+get <crates:flate2::1.0>
+get <crates:zstd::0.13>
+get <crates:lz4::1.24>
+
+fun hks_source_code_data_compression() [
+    native {Rust} [
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
 use flate2::Compression as FlateCompression;
@@ -182,3 +189,6 @@ impl Compression {
         }
     }
 }
+
+    ]
+]
