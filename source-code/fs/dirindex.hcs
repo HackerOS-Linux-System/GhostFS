@@ -1,3 +1,10 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:serde::1.0>
+get <crates:hex::0.4>
+
+fun hks_source_code_fs_dirindex() [
+    native {Rust} [
 use sled::Db;
 use serde::{Serialize, Deserialize};
 use std::ffi::{OsStr, OsString};
@@ -124,3 +131,6 @@ impl DirIndex {
         Ok(())
     }
 }
+
+    ]
+]
