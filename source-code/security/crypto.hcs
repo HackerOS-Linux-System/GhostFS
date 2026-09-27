@@ -1,3 +1,14 @@
+get <crates:fuser::0.15>
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:log::0.4>
+get <crates:aes-gcm::0.10>
+get <crates:blake3::1.5>
+get <crates:rand::0.8>
+get <crates:zeroize::1.7>
+
+fun hks_source_code_security_crypto() [
+    native {Rust} [
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use blake3::Hasher;
@@ -340,3 +351,6 @@ impl Crypto {
 impl Drop for Crypto {
     fn drop(&mut self) { self.master_key.zeroize(); }
 }
+
+    ]
+]
