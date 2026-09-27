@@ -1,3 +1,8 @@
+get <crates:log::0.4>
+get <crates:libc::0.2>
+
+fun hks_source_code_security_memlock() [
+    native {Rust} [
 pub fn harden_process() {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -71,3 +76,6 @@ fn warn_on_unencrypted_swap() {
         );
     }
 }
+
+    ]
+]
