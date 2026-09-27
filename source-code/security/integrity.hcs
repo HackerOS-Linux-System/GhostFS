@@ -1,3 +1,10 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:log::0.4>
+get <crates:blake3::1.5>
+
+fun hks_source_code_security_integrity() [
+    native {Rust} [
 use sled::Db;
 use crate::error::HfsError;
 
@@ -182,3 +189,6 @@ fn merkle_root(leaves: &[Vec<u8>]) -> Vec<u8> {
     }
     level.remove(0)
 }
+
+    ]
+]
