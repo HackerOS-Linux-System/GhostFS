@@ -4,7 +4,13 @@ using <gen 2>
 # <main/colors>
 
 % INSTALL_DIR: str = /usr/local/bin
-% CARGO: str = cargo
+% VIRUS: str = virus
+
+;; GhostFS (edycja HackerScript) — TYLKO tryb cybersec. W odroznieniu od
+;; wersji Rust (ktora miala tez tryb "normal" do codziennego uzytku), ten
+;; build.hl buduje wylacznie wariant cybersecurity — nie ma tu i nie bedzie
+;; trybu "normal". Kompiluje przez `virus`/`hackerc` (HackerScript -> Rust),
+;; nie bezposrednio przez `cargo`.
 
 ;; ── Helper ────────────────────────────────────────────────
 
@@ -18,87 +24,63 @@ done
 
 ;; ── Targets ───────────────────────────────────────────────
 
-: normal def
-    -- info
-    \~> Building GhostFS Normal (release)...
-    > @CARGO build --release --features normal,zstd,lz4
-    -- ok
-    \~> Binary: target/release/ghostfs
-done
-
 : cybersec def
     -- info
-    \~> Building GhostFS Cybersec (release)...
-    > @CARGO build --no-default-features --release --features cybersec,zstd,lz4
+    \~> Building GhostFS-HackerScript [CYBERSEC MODE — jedyny tryb]...
+    > @VIRUS build --release --features cybersec,zstd,lz4
     -- ok
-    \~> Binary: target/release/ghostfs  [CYBERSEC MODE]
-done
-
-: normal-debug def
-    > @CARGO build --features normal,zstd,lz4
+    \~> Binary: target/release/ghostfs-cybersec
 done
 
 : cybersec-debug def
-    > @CARGO build --no-default-features --features cybersec,zstd,lz4
+    > @VIRUS build --features cybersec,zstd,lz4
 done
 
 : test def
     -- info
-    \~> Testing Normal mode...
-    > @CARGO test --features normal,zstd,lz4
-
-    -- info
-    \~> Testing Cybersec mode...
-    > @CARGO test --no-default-features --features cybersec,zstd,lz4
+    \~> Testing Cybersec mode (jedyny tryb w tej edycji)...
+    > @VIRUS test --features cybersec,zstd,lz4
 done
 
 : install def
-    -- normal
-    ^> install -m 755 target/release/ghostfs @INSTALL_DIR/ghostfs
-    -- ok
-    \~> Installed to @INSTALL_DIR/ghostfs
-done
-
-: install-cybersec def
     -- cybersec
-    ^> install -m 755 target/release/ghostfs @INSTALL_DIR/ghostfs-cybersec
+    ^> install -m 755 target/release/ghostfs-cybersec @INSTALL_DIR/ghostfs-cybersec
     -- ok
     \~> Installed to @INSTALL_DIR/ghostfs-cybersec
 done
 
 : fmt def
-    > @CARGO fmt --all
+    > @VIRUS fmt --all
 done
 
 : check def
-    > @CARGO check --features normal,zstd,lz4
-    > @CARGO check --no-default-features --features cybersec,zstd,lz4
-    > @CARGO clippy --features normal,zstd,lz4 -- -D warnings
+    > @VIRUS check --features cybersec,zstd,lz4
+    > @VIRUS lint --features cybersec,zstd,lz4
 done
 
 : clean def
-    > @CARGO clean
+    > @VIRUS clean
 done
 
 : all def
-    -- normal
+    -- cybersec
 done
 
 : help def
-    \~> GhostFS Makefile (Hacker Lang)
-    \~> 
+    \~> GhostFS-HackerScript build.hl (Hacker Lang)
+    \~>
+    \~> Ta edycja jest WYLACZNIE do cyberbezpieczenstwa — nie ma trybu
+    \~> "normal" (jest w oryginalnej wersji Rust GhostFS).
+    \~>
     \~> Available targets:
-    \~>   normal           — build Normal mode (release)
-    \~>   cybersec         — build Cybersec mode (release)
-    \~>   normal-debug     — build Normal mode (debug)
+    \~>   cybersec         — build Cybersec mode (release, jedyny tryb)
     \~>   cybersec-debug   — build Cybersec mode (debug)
-    \~>   test             — run tests for both modes
-    \~>   install          — install Normal to /usr/local/bin
-    \~>   install-cybersec — install Cybersec version
-    \~>   fmt              — cargo fmt --all
-    \~>   check            — cargo check + clippy
-    \~>   clean            — cargo clean
-    \~>   all              — same as normal
+    \~>   test             — run tests (cybersec)
+    \~>   install          — install do /usr/local/bin
+    \~>   fmt              — virus fmt --all
+    \~>   check            — virus check + lint
+    \~>   clean            — virus clean
+    \~>   all              — same as cybersec
     \~>   help             — this message
 done
 
@@ -111,20 +93,14 @@ done
 done
 
 ? switch @target
-| normal
-    -- normal
 | cybersec
     -- cybersec
-| normal-debug
-    -- normal-debug
 | cybersec-debug
     -- cybersec-debug
 | test
     -- test
 | install
     -- install
-| install-cybersec
-    -- install-cybersec
 | fmt
     -- fmt
 | check
