@@ -1,3 +1,9 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:serde::1.0>
+
+fun hks_source_code_fs_extents() [
+    native {Rust} [
 use sled::Db;
 use serde::{Serialize, Deserialize};
 use crate::error::HfsError;
@@ -157,3 +163,6 @@ impl ExtentTree {
         Ok(())
     }
 }
+
+    ]
+]
