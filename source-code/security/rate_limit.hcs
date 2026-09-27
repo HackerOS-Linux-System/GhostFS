@@ -1,3 +1,7 @@
+get <crates:log::0.4>
+
+fun hks_source_code_security_rate_limit() [
+    native {Rust} [
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -137,3 +141,6 @@ impl RateLimiter {
 }
 
 impl Default for RateLimiter { fn default() -> Self { Self::new() } }
+
+    ]
+]
