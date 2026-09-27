@@ -1,3 +1,12 @@
+get <crates:serde::1.0>
+get <crates:rand::0.8>
+get <crates:hex::0.4>
+get <crates:argon2::0.5>
+get <crates:zeroize::1.7>
+get <crates:rpassword::7.3>
+
+fun hks_source_code_security_kdf() [
+    native {Rust} [
 use argon2::{Argon2, Algorithm, Version, Params};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use rand::Rng;
@@ -61,3 +70,6 @@ pub fn read_passphrase_confirm(prompt: &str) -> Result<String, HfsError> {
         eprintln!("Passphrases do not match — try again.");
     }
 }
+
+    ]
+]
