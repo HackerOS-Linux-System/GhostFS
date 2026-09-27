@@ -1,10 +1,37 @@
-# GhostFS
-File system for HackerOS
+# GhostFS — edycja HackerScript
+File system for HackerOS — HackerScript port of the original Rust GhostFS.
 
 ## What is GhostFS ?
 It is a file system as an alternative to ext4 or other file systems but aimed at cybersecurity.
 
 GhostFS was formerly also known as HackerFS.
+
+## Ta edycja (HackerScript) vs. oryginal (Rust)
+
+Ten katalog to port **1:1** oryginalnego GhostFS (Rust) na język
+[HackerScript](https://github.com/) — sama logika, ten sam algorytm
+szyfrowania, MAC/IDS, forensics, WORM, canary itd., przepisane na `.hcs`
+(zamiast `.rs`), z tymi samymi ścieżkami/nazwami plików co oryginał.
+Ponieważ HackerScript (0.4) nie ma jeszcze traitów, generyków, `async` ani
+referencji w sygnaturach funkcji, cały kod systemowy (implementacja `fuser::
+Filesystem`, streaming gRPC forensics, wiązania TPM, prymitywy kryptograficzne)
+jest osadzony w blokach `native {Rust} [ ... ]` — patrz nagłówek każdego
+pliku `.hcs` oraz `docs/SYNTAX.md` w repozytorium HackerScript.
+
+**Jedyna zamierzona różnica funkcjonalna względem wersji Rust:**
+
+| | GhostFS (Rust) | GhostFS (HackerScript) |
+|---|---|---|
+| Zastosowanie | cyberbezpieczeństwo **i** codzienny użytek (tryb `normal`) | **wyłącznie** cyberbezpieczeństwo — firmy i świadomi bezpieczeństwa użytkownicy |
+| Tryb `normal` (szyfrowanie opcjonalne) | tak | **nie istnieje** |
+| Szyfrowanie / MAC / IDS / forensics / canary / WORM / rate-limit | zawsze w trybie `cybersec`, opcjonalne w `normal` | **zawsze włączone, bez możliwości wyłączenia** |
+| Binarka | `ghostfs` / `ghostfs-cybersec` | tylko `ghostfs-cybersec` |
+| Build | `cargo` / `build.hl` (`CARGO`) | `virus`/`hackerc` / `build.hl` (`VIRUS`) |
+
+Innymi słowy: identyczne działanie, identyczna struktura plików — poza tym,
+że ta edycja została świadomie zawężona do zastosowań stricte
+cyberbezpieczeństwa i nie jest rekomendowana do zwykłego, codziennego
+użytku komputerowego.
 
 ## Backup & Restore
 
@@ -22,7 +49,7 @@ separate secret for the backup file itself (recommended if the backup will
 be stored with a third party). Incremental backups (`--since-seq` +
 `--changed-inodes`, sourced from `ghostfs forensics tail`) only export the
 inodes that changed, for fast periodic snapshots. See
-`source-code/data/backup.rs` for the on-disk format.
+`source-code/data/backup.hcs` for the on-disk format.
 
 ## Early-boot unlock (TPM) & recovery mode
 
@@ -50,7 +77,7 @@ patches an already-installed Calamares so its graphical installer offers
 
 Sequential reads are detected per-inode and the next few blocks are
 decrypted/decompressed ahead of time on a small `rayon` thread pool
-(`source-code/core/prefetch.rs`), populating the LRU cache before the FUSE
+(`source-code/core/prefetch.hcs`), populating the LRU cache before the FUSE
 layer asks for them.
 
 ## Cybersecurity hardening (v0.4)
@@ -116,11 +143,11 @@ the implementation:
   syslog event + optional per-file webhook, and feeds straight into
   `AutoResponse`'s lockout escalation (see v0.4 notes above). Previously
   this CLI existed but called methods that didn't exist anywhere in
-  `canary.rs` (which only implemented an unrelated periodic HTTPS beacon).
+  `canary.hcs` (which only implemented an unrelated periodic HTTPS beacon).
 
 ## Ransomware behavior detection (v0.6)
 
-`security/ransomware.rs` — every write is checked (Shannon entropy of the
+`security/ransomware.hcs` — every write is checked (Shannon entropy of the
 raw plaintext GhostFS receives from the client, before its own encryption)
 against a per-UID sliding window (60s). If a UID rewrites ≥15 distinct
 files with ≥75% of those writes looking high-entropy (≥7.5 bits/byte —
@@ -139,7 +166,7 @@ ghostfs ransomware disable --device /dev/sdX1   # not recommended
 ```
 
 Detection alone doesn't undo damage already written before the threshold
-tripped — that's what `data/versioning.rs` (previous file versions) and
+tripped — that's what `data/versioning.hcs` (previous file versions) and
 `ghostfs backup` exist for; this module is one layer of defense-in-depth,
 designed to work alongside them, not replace them.
 
@@ -156,7 +183,7 @@ designed to work alongside them, not replace them.
   ghostfs shamir split   --key-file key.hex --shares 5 --threshold 3 --output-dir ./shares
   ghostfs shamir combine --share-files s1.txt,s2.txt,s3.txt --output key.hex
   ```
-- **Process memory hardening** (`security/memlock.rs`) — `mount`, `keygen`,
+- **Process memory hardening** (`security/memlock.hcs`) — `mount`, `keygen`,
   `tpm-seal-key`, and `shamir combine` now call `mlockall()` (keys never
   swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)` (no core dumps, no
   `ptrace` attach by other users, even root without `CAP_SYS_PTRACE`)
@@ -223,15 +250,15 @@ directory appear empty to `rmdir`, a real corruption bug; fixed to check
 **Still open**: `fuser::FileAttr` (size, permissions, timestamps, uid/gid)
 is stored as plain `bincode` in the `inode:{ino}` sled value — confirmed via
 `grep -rln 'format!("inode:{}"'`, the scope is exactly 3 files:
-  - `fs/lib.rs` (`get_inode`/`put_inode`, the canonical accessors)
-  - `fs/fs.rs` (several handlers write `inode:{ino}` directly inside atomic
+  - `fs/lib.hcs` (`get_inode`/`put_inode`, the canonical accessors)
+  - `fs/fs.hcs` (several handlers write `inode:{ino}` directly inside atomic
     `with_batch` closures for transactional consistency with directory
     updates — these bypass `put_inode` and would each need the same
     encrypt/decrypt applied)
-  - `data/repair.rs::verify_and_repair` (already holds `Option<Crypto>`,
+  - `data/repair.hcs::verify_and_repair` (already holds `Option<Crypto>`,
     deserializes the `Inode` struct directly for size/corruption checks)
 
-  `data/versioning.rs` needs **no changes** — it round-trips inode bytes as
+  `data/versioning.hcs` needs **no changes** — it round-trips inode bytes as
   an opaque blob, so it works transparently whether or not they're
   encrypted.
 
@@ -253,18 +280,18 @@ file *contents* and *names* were already fully encrypted.
 
 Scope of the fix (verified by grepping every `format!("inode:{}"` call
 site in the project, not guessed):
-  - `fs/lib.rs`: `get_inode`/`put_inode` (canonical accessors) plus the
+  - `fs/lib.hcs`: `get_inode`/`put_inode` (canonical accessors) plus the
     standalone `format()` (mkfs) function's root-inode write, which needed
     its own temporary `Crypto` instance since `GhostFS` doesn't exist yet
     at that point.
-  - `fs/fs.rs`: 17 raw `b.insert(format!("inode:{}", ...), bincode::serialize(...))`
+  - `fs/fs.hcs`: 17 raw `b.insert(format!("inode:{}", ...), bincode::serialize(...))`
     calls inside atomic `with_batch` closures (for transactional
     consistency with directory updates) — all converted to
     `self.encrypt_inode(...)`.
-  - `data/repair.rs::verify_and_repair`: decrypts via its existing
+  - `data/repair.hcs::verify_and_repair`: decrypts via its existing
     `Option<Crypto>` field (falls back to plain bincode if the volume has
     no encryption key at all, i.e. non-cybersec unencrypted mode).
-  - `data/versioning.rs` and `data/backup.rs` needed **no changes** — both
+  - `data/versioning.hcs` and `data/backup.hcs` needed **no changes** — both
     treat inode bytes as an opaque blob (round-tripped or filtered by key
     string only), so they work transparently whether or not the value is
     encrypted underneath.
@@ -282,14 +309,14 @@ package's `Built-Variant` control field both reflect the choice.
 ## Extended attribute encryption + rmdir xattr cleanup (v1.1)
 
 Same class of gap as the file-name and inode-metadata fixes above, found
-by applying the same scrutiny to `fs/xattr.rs`: xattr **names** were
+by applying the same scrutiny to `fs/xattr.hcs`: xattr **names** were
 embedded in plaintext directly in the sled key, and **values** were
 stored completely unencrypted. xattrs routinely hold sensitive data
 (SELinux/AppArmor labels, ACL-like data, app-set tokens, "downloaded
 from `<url>`" provenance metadata) — this was a real, active
 confidentiality gap, not theoretical.
 
-Fixed with the same architecture already proven for `dirindex.rs`: a
+Fixed with the same architecture already proven for `dirindex.hcs`: a
 keyed blind index (`Crypto::xattr_blind_index`) for O(1) lookup without
 decryption, plus AES-256-GCM for both the recoverable name and value
 (`Crypto::derive_xattr_enc_key`, per-inode).
@@ -312,7 +339,7 @@ same inode number.
 The full pipeline ran green end-to-end for the first time (build, cargo
 test, packaging, lintian, install) — including a genuine confirmation that
 the from-scratch GF(256) Shamir's Secret Sharing implementation
-(`security/shamir.rs`) is correct: `cargo test` actually executed
+(`security/shamir.hcs`) is correct: `cargo test` actually executed
 `shamir::tests::split_combine_roundtrip` and `below_threshold_fails`, both
 `ok`.
 
@@ -332,10 +359,10 @@ build log: an unused import left over from the dirname-encryption
 refactor, a legitimately-unused-for-now `remove_block` helper (kept,
 `#[allow(dead_code)]`, as a documented building block for future
 truncate-shrink support), a pre-existing unimplemented
-`INCREMENTAL_THRESHOLD` design intent in `integrity.rs`, four
-`canary-https`-feature-gated items in `canary.rs` that are legitimately
+`INCREMENTAL_THRESHOLD` design intent in `integrity.hcs`, four
+`canary-https`-feature-gated items in `canary.hcs` that are legitimately
 unused in the default (non-`canary-https`) build, and a
-`drop(&mut reference)` no-op in `rate_limit.rs` replaced with the
+`drop(&mut reference)` no-op in `rate_limit.hcs` replaced with the
 compiler-suggested `let _ = ...`.
 
 `build.yml`'s dash/POSIX-sh verification step now also checks
