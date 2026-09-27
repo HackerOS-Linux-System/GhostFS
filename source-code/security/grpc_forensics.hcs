@@ -1,3 +1,12 @@
+get <crates:serde::1.0>
+get <crates:log::0.4>
+get <crates:blake3::1.5>
+get <crates:hex::0.4>
+get <crates:prost::0.12>
+get <crates:tokio::1>
+
+fun hks_source_code_security_grpc_forensics() [
+    native {Rust} [
 #![allow(dead_code)]
 
 use tokio::sync::broadcast;
@@ -217,3 +226,6 @@ pub async fn run_grpc_server(
         }
     }
 }
+
+    ]
+]
