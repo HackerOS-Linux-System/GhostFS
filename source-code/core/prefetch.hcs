@@ -1,3 +1,10 @@
+get <crates:sled::0.34>
+get <crates:log::0.4>
+get <crates:rayon::1.10>
+get <crates:dashmap::5.5>
+
+fun hks_source_code_core_prefetch() [
+    native {Rust} [
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -163,3 +170,6 @@ fn prefetch_one(
     cache.put_block(ino, block_idx, decompressed);
     Ok(())
 }
+
+    ]
+]
