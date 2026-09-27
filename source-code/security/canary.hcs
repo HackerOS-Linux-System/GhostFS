@@ -1,3 +1,12 @@
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:serde::1.0>
+get <crates:log::0.4>
+get <crates:blake3::1.5>
+get <crates:hex::0.4>
+
+fun hks_source_code_security_canary() [
+    native {Rust} [
 use sled::Db;
 use serde::{Serialize, Deserialize};
 use std::time::Duration;
@@ -319,3 +328,6 @@ impl Canary {
             .ok();
     }
 }
+
+    ]
+]
