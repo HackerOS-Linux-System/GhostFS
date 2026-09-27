@@ -1,3 +1,7 @@
+get <crates:lru::0.12>
+
+fun hks_source_code_core_cache() [
+    native {Rust} [
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -66,3 +70,6 @@ impl Cache {
 impl Default for Cache {
     fn default() -> Self { Self::new() }
 }
+
+    ]
+]
