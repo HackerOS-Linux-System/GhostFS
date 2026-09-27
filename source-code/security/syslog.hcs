@@ -1,3 +1,8 @@
+get <crates:sled::0.34>
+get <crates:log::0.4>
+
+fun hks_source_code_security_syslog() [
+    native {Rust} [
 use sled::Db;
 use std::net::UdpSocket;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,3 +168,6 @@ impl SyslogSender {
         (if m <= 2 { y + 1 } else { y }, m, d)
     }
 }
+
+    ]
+]
