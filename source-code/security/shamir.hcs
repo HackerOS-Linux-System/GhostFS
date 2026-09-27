@@ -1,3 +1,8 @@
+get <crates:rand::0.8>
+get <crates:hex::0.4>
+
+fun hks_source_code_security_shamir() [
+    native {Rust} [
 use rand::RngCore;
 use crate::error::HfsError;
 
@@ -190,3 +195,6 @@ mod tests {
         assert!(combine(&subset).is_err());
     }
 }
+
+    ]
+]
