@@ -1,3 +1,9 @@
+get <crates:sled::0.34>
+get <crates:log::0.4>
+get <crates:rand::0.8>
+
+fun hks_source_code_security_secure_delete() [
+    native {Rust} [
 use sled::Db;
 use rand::Rng;
 use crate::error::HfsError;
@@ -119,3 +125,6 @@ impl SecureDelete {
         Ok(())
     }
 }
+
+    ]
+]
