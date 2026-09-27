@@ -1,3 +1,11 @@
+get <crates:fuser::0.15>
+get <crates:sled::0.34>
+get <crates:bincode::1.3.3>
+get <crates:log::0.4>
+get <crates:libc::0.2>
+
+fun hks_source_code_fs_fs() [
+    native {Rust} [
 use crate::*;
 use crate::{mac, worm};
 use fuser::{
@@ -679,3 +687,6 @@ impl GhostFS {
         None
     }
 }
+
+    ]
+]
