@@ -1,85 +1,28 @@
 [package]
-name = "ghostfs"
-version = "0.3.0"
-edition = "2021"
-description = "GhostFS — cybersecurity filesystem for HackerOS"
+-> name        => GhostFS
+-> version     => 0.5.0
+-> using       => 0.4
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> description => GhostFS (edycja HackerScript) - system plikow HackerOS.
 
 [lib]
-name = "ghostfs"
-path = "source-code/fs/lib.rs"
+-> name => ghostfs
+-> path => source-code/fs/lib.hcs
 
-[[bin]]
-name = "ghostfs"
-path = "source-code/main.rs"
+[bin]
+-> name => ghostfs
+-> path => source-code/main.hcs
 
 [dependencies]
-fuser        = "0.15"
-sled         = "0.34"
-bincode      = "1.3.3"
-serde        = { version = "1.0", features = ["derive"] }
-clap         = { version = "4.5", features = ["derive"] }
-log          = "0.4"
-env_logger   = "0.11"
-libc         = "0.2"
-aes-gcm      = "0.10"
-blake3       = "1.5"
-rand         = "0.8"
-hex          = "0.4"
-flate2       = "1.0"
-rayon        = "1.10"
-lru          = "0.12"
-dashmap      = "5.5"
-crossbeam    = "0.8"
-thiserror    = "1.0"
-anyhow       = "1.0"
-argon2       = "0.5"
-zeroize      = { version = "1.7", features = ["derive"] }
-subtle       = "2.5"
-# Secure passphrase input (no terminal echo)
-rpassword    = "7.3"
-# gRPC streaming forensics
-tonic        = { version = "0.11", features = ["tls"] }
-prost        = "0.12"
-tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-stream = "0.1"
-# TPM 2.0 key sealing (optional — requires tpm2-tss system library)
-tss-esapi    = { version = "7.5", optional = true }
-zstd         = { version = "0.13", optional = true }
-lz4          = { version = "1.24", optional = true }
-# Ed25519 signatures for `ghostfs forensics export --signed` — asymmetric
-# so a third party (court, external auditor) can verify chain-of-custody
-# authenticity WITHOUT needing access to the volume's master key. HMAC
-# (used elsewhere in this codebase, e.g. audit.rs/superblock.rs) is
-# intentionally NOT used here: HMAC verification requires the same secret
-# that produced it, which means "verifiable by anyone" and "only the
-# volume holder could have produced it" can't both be true at once — the
-# exact property a legal chain-of-custody signature needs.
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+-> std
+--> io => "*"
+--> fs => "*"
 
 [features]
-default  = ["normal", "zstd", "lz4"]
-zstd     = ["dep:zstd"]
-lz4      = ["dep:lz4"]
-tpm      = ["dep:tss-esapi"]
-# ── Build modes ──────────────────────────────────────────────────────────
-# Marker features (no extra deps) consumed by `Makefile` / CI to select
-# the binary's default behaviour at compile time. Previously referenced
-# by `make normal` / `make cybersec` but not actually declared here —
-# builds using those Makefile targets would fail with "unknown feature".
-normal   = []
-cybersec = []
-# gRPC forensics streaming over TLS (see security/grpc_forensics.rs) —
-# optional because it pulls in rustls/tokio-rustls/rustls-pemfile.
-grpc-tls = []
-# HTTPS canary beacon (see security/canary.rs) — optional, needs reqwest.
-canary-https = []
-
-[build-dependencies]
-tonic-build = "0.11"
-
-[profile.release]
-opt-level     = 3
-lto           = "fat"
-codegen-units = 1
-panic         = "abort"
-strip         = true
+-> default  => ["cybersec", "zstd", "lz4"]
+-> cybersec => []
+-> zstd     => []
+-> lz4      => []
+-> tpm      => []
+-> grpc-tls => []
+-> canary-https => []
